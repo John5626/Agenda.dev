@@ -1,0 +1,23 @@
+services:
+  frontend:
+    build: ./frontend
+    ports:
+      - "5174:5174"
+    depends_on:
+      - api
+
+  api:
+    build: ./backend
+    ports:
+      - "8080:8080" #
+    environment:
+      MONGO_CONNECTION_STRING: "mongodb://mongo:27017"
+      MONGO_DB: "calendar"
+    depends_on:
+      - mongo
+
+  mongo:
+    image: mongo:7
+    command: ["mongod", "--bind_ip_all"]
+    tmpfs:
+      - /data/db
