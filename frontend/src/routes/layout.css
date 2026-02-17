@@ -233,6 +233,11 @@
   background: #ffffff;
 }
 
+.week-main-scroll {
+  overflow-y: hidden;
+  overscroll-behavior-x: contain;
+}
+
 .week-day-column {
   border-left-color: #edf1f6;
 }

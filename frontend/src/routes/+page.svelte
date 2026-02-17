@@ -2,30 +2,43 @@
   import { onMount, tick } from "svelte";
   import type { Appointment, DeleteScope, Recurrence } from "$lib/api";
   import { createAppointment, deleteAppointment, listAppointments, updateAppointment } from "$lib/api";
-
-  const WEEKDAY_HEADER = ["DOM.", "SEG.", "TER.", "QUA.", "QUI.", "SEX.", "SAB."];
-  const MINI_WEEKDAY_HEADER = ["D", "S", "T", "Q", "Q", "S", "S"];
-  const MONTHS_SHORT = ["Jan", "Fev", "Mar", "Abr", "Mai", "Jun", "Jul", "Ago", "Set", "Out", "Nov", "Dez"];
-  const MONTHS_LONG = [
-    "Janeiro",
-    "Fevereiro",
-    "Março",
-    "Abril",
-    "Maio",
-    "Junho",
-    "Julho",
-    "Agosto",
-    "Setembro",
-    "Outubro",
-    "Novembro",
-    "Dezembro"
-  ];
+  import CalendarSidebar from "$lib/components/CalendarSidebar.svelte";
+  import CalendarToast from "$lib/components/CalendarToast.svelte";
+  import CalendarTopbar from "$lib/components/CalendarTopbar.svelte";
+  import {
+    clamp,
+    formatRange,
+    hexToRgba,
+    pad2,
+    sameDay,
+    toLocalDateValueFromIso,
+    toLocalInputValue,
+    toUtcIso,
+    toUtcIsoEndOfDay
+  } from "$lib/utils/date";
+  import {
+    buildMiniDays,
+    buildWeekDays,
+    formatMiniMonthTitle,
+    formatMonthTitle,
+    MINI_WEEKDAY_HEADER,
+    startOfWeekSunday,
+    type MiniDay,
+    WEEKDAY_HEADER
+  } from "$lib/utils/week";
 
   const HOUR_HEIGHT = 48;
   const DAY_MINUTES = 24 * 60;
   const DAY_HEIGHT = 24 * HOUR_HEIGHT;
   const SNAP_MINUTES = 15;
   const PX_PER_MINUTE = HOUR_HEIGHT / 60;
+  const WEEK_TIME_AXIS_WIDTH_PX = 72;
+  const WEEK_DAY_MIN_WIDTH_PX = 160;
+  const WEEK_CONTENT_MIN_WIDTH_PX = WEEK_TIME_AXIS_WIDTH_PX + WEEK_DAY_MIN_WIDTH_PX * 7;
+  const DAY_EVENT_HORIZONTAL_INSET_PX = 4;
+  const DAY_EVENT_OVERLAP_RATIO = 0.18;
+  const DAY_EVENT_MIN_HEIGHT_WITH_TIME = 46;
+  const DAY_EVENT_MAX_COLUMNS_WITH_TIME = 2;
   const HOUR_ROWS = Array.from({ length: 24 }, (_, idx) => idx);
   const MULTI_DAY_ROW_HEIGHT = 36;
   const MULTI_DAY_ROW_GAP = 8;
@@ -54,11 +67,15 @@
     recurrenceUntilIso: string | null;
     seriesId: string | null;
     dayIndex: number;
+    startMinutes: number;
+    endMinutes: number;
     top: number;
     height: number;
     fullDurationMs: number;
     segmentDurationMs: number;
     canDrag: boolean;
+    column: number;
+    columnsCount: number;
   };
 
   type MultiDayAppointment = {
@@ -75,13 +92,6 @@
     endDayIndex: number;
     row: number;
     canDrag: boolean;
-  };
-
-  type MiniDay = {
-    date: Date;
-    inMonth: boolean;
-    isToday: boolean;
-    inCurrentWeek: boolean;
   };
 
   type DragMeta = {
@@ -189,8 +199,8 @@
   let calendarPanelEl: HTMLElement | null = null;
 
   $: weekDays = buildWeekDays(weekStart);
-  $: monthTitle = `${MONTHS_SHORT[weekAnchor.getMonth()]} de ${weekAnchor.getFullYear()}`;
-  $: miniMonthTitle = `${MONTHS_LONG[miniMonthCursor.getMonth()]} de ${miniMonthCursor.getFullYear()}`;
+  $: monthTitle = formatMonthTitle(weekAnchor);
+  $: miniMonthTitle = formatMiniMonthTitle(miniMonthCursor);
   $: miniDays = buildMiniDays(miniMonthCursor, weekStart);
   $: renderedItems = buildRenderedItems(items, weekDays);
   $: multiDayItems = buildMultiDayItems(items, weekDays);
@@ -209,7 +219,14 @@
         )
       : MULTI_DAY_MIN_HEIGHT;
   $: itemsByDay = Array.from({ length: 7 }, (_, dayIndex) =>
-    renderedItems.filter((item) => item.dayIndex === dayIndex)
+    renderedItems
+      .filter((item) => item.dayIndex === dayIndex)
+      .sort((a, b) => {
+        if (a.startMinutes !== b.startMinutes) return a.startMinutes - b.startMinutes;
+        if (a.column !== b.column) return a.column - b.column;
+        if (a.endMinutes !== b.endMinutes) return b.endMinutes - a.endMinutes;
+        return a.id.localeCompare(b.id);
+      })
   );
   $: renderedById = new Map(items.filter((item) => !!item.id).map((item) => [item.id!, item]));
   $: selectedItem = selectedEventId ? renderedById.get(selectedEventId) ?? null : null;
@@ -218,74 +235,6 @@
     toast = message;
     if (toastTimer) clearTimeout(toastTimer);
     toastTimer = setTimeout(() => (toast = ""), 2600);
-  }
-
-  function pad2(value: number) {
-    return value.toString().padStart(2, "0");
-  }
-
-  function clamp(value: number, min: number, max: number) {
-    return Math.min(max, Math.max(min, value));
-  }
-
-  function toLocalInputValue(date: Date) {
-    const year = date.getFullYear();
-    const month = pad2(date.getMonth() + 1);
-    const day = pad2(date.getDate());
-    const hours = pad2(date.getHours());
-    const minutes = pad2(date.getMinutes());
-    return `${year}-${month}-${day}T${hours}:${minutes}`;
-  }
-
-  function toUtcIso(localDatetime: string) {
-    return new Date(localDatetime).toISOString();
-  }
-
-  function toUtcIsoEndOfDay(localDate: string) {
-    const end = new Date(`${localDate}T23:59`);
-    return end.toISOString();
-  }
-
-  function toLocalDateValueFromIso(iso: string | null | undefined) {
-    if (!iso) return "";
-    const date = new Date(iso);
-    if (Number.isNaN(date.getTime())) return "";
-    return `${date.getFullYear()}-${pad2(date.getMonth() + 1)}-${pad2(date.getDate())}`;
-  }
-
-  function startOfWeekSunday(date: Date) {
-    const copy = new Date(date);
-    copy.setHours(0, 0, 0, 0);
-    copy.setDate(copy.getDate() - copy.getDay());
-    return copy;
-  }
-
-  function buildWeekDays(start: Date) {
-    return Array.from({ length: 7 }, (_, idx) => {
-      const d = new Date(start);
-      d.setDate(start.getDate() + idx);
-      d.setHours(0, 0, 0, 0);
-      return d;
-    });
-  }
-
-  function sameDay(a: Date, b: Date) {
-    return a.getFullYear() === b.getFullYear() && a.getMonth() === b.getMonth() && a.getDate() === b.getDate();
-  }
-
-  function hexToRgba(hex: string, alpha: number) {
-    const normalized = hex.replace("#", "").trim();
-    if (normalized.length !== 6) return `rgba(59, 130, 246, ${alpha})`;
-    const r = Number.parseInt(normalized.slice(0, 2), 16);
-    const g = Number.parseInt(normalized.slice(2, 4), 16);
-    const b = Number.parseInt(normalized.slice(4, 6), 16);
-    return `rgba(${r}, ${g}, ${b}, ${alpha})`;
-  }
-
-  function formatRange(startIso: string, endIso: string) {
-    const start = new Date(startIso);
-    const end = new Date(endIso);
-    return `${pad2(start.getHours())}:${pad2(start.getMinutes())} - ${pad2(end.getHours())}:${pad2(end.getMinutes())}`;
   }
 
   function isMultiDaySpan(startIso: string, endIso: string) {
@@ -399,26 +348,8 @@
     recurrenceUntilLocal = "";
   }
 
-  function buildMiniDays(cursor: Date, selectedWeekStart: Date): MiniDay[] {
-    const firstOfMonth = new Date(cursor.getFullYear(), cursor.getMonth(), 1);
-    const gridStart = startOfWeekSunday(firstOfMonth);
-    const selectedWeekDays = buildWeekDays(selectedWeekStart);
-
-    return Array.from({ length: 42 }, (_, idx) => {
-      const cellDate = new Date(gridStart);
-      cellDate.setDate(gridStart.getDate() + idx);
-      cellDate.setHours(0, 0, 0, 0);
-      return {
-        date: cellDate,
-        inMonth: cellDate.getMonth() === cursor.getMonth(),
-        isToday: sameDay(cellDate, new Date()),
-        inCurrentWeek: selectedWeekDays.some((d) => sameDay(d, cellDate))
-      };
-    });
-  }
-
   function buildRenderedItems(source: Appointment[], week: Date[]): RenderedAppointment[] {
-    return source.flatMap((item) => {
+    const segments = source.flatMap((item) => {
       if (!item.id) return [];
 
       const startDate = new Date(item.start);
@@ -445,13 +376,11 @@
 
         const segmentStart = startDate > dayStart ? startDate : dayStart;
         const segmentEnd = endDate < dayEnd ? endDate : dayEnd;
-        const segmentDurationMinutes = Math.max(15, Math.round((segmentEnd.getTime() - segmentStart.getTime()) / 60_000));
-        const startMinutes = segmentStart.getHours() * 60 + segmentStart.getMinutes();
-        const boundedStartMinutes = clamp(startMinutes, 0, DAY_MINUTES - 15);
-        const boundedDurationMinutes = Math.max(
-          15,
-          Math.min(segmentDurationMinutes, DAY_MINUTES - boundedStartMinutes)
-        );
+        const rawStartMinutes = Math.floor((segmentStart.getTime() - dayStart.getTime()) / 60_000);
+        const rawEndMinutes = Math.ceil((segmentEnd.getTime() - dayStart.getTime()) / 60_000);
+        const boundedStartMinutes = clamp(rawStartMinutes, 0, DAY_MINUTES - 15);
+        const boundedEndMinutes = clamp(rawEndMinutes, boundedStartMinutes + 15, DAY_MINUTES);
+        const boundedDurationMinutes = Math.max(15, boundedEndMinutes - boundedStartMinutes);
 
         segments.push({
           id: item.id,
@@ -464,16 +393,95 @@
           recurrenceUntilIso,
           seriesId,
           dayIndex,
+          startMinutes: boundedStartMinutes,
+          endMinutes: boundedEndMinutes,
           top: boundedStartMinutes * PX_PER_MINUTE,
           height: Math.max(32, boundedDurationMinutes * PX_PER_MINUTE),
           fullDurationMs,
           segmentDurationMs: boundedDurationMinutes * 60_000,
-          canDrag
+          canDrag,
+          column: 0,
+          columnsCount: 1
         });
       }
 
       return segments;
     });
+
+    const segmentsByDay = Array.from({ length: 7 }, () => [] as RenderedAppointment[]);
+    for (const segment of segments) {
+      segmentsByDay[segment.dayIndex]?.push(segment);
+    }
+
+    for (const daySegments of segmentsByDay) {
+      daySegments.sort((a, b) => {
+        if (a.startMinutes !== b.startMinutes) return a.startMinutes - b.startMinutes;
+        if (a.endMinutes !== b.endMinutes) return a.endMinutes - b.endMinutes;
+        return a.id.localeCompare(b.id);
+      });
+
+      let active: Array<{ endMinutes: number; column: number }> = [];
+      let cluster: RenderedAppointment[] = [];
+      let clusterColumns = 1;
+
+      const flushCluster = () => {
+        const columnsCount = Math.max(1, clusterColumns);
+        for (const segment of cluster) {
+          segment.columnsCount = columnsCount;
+        }
+        cluster = [];
+        clusterColumns = 1;
+      };
+
+      for (const segment of daySegments) {
+        active = active.filter((lane) => lane.endMinutes > segment.startMinutes);
+
+        if (active.length === 0 && cluster.length > 0) {
+          flushCluster();
+        }
+
+        const usedColumns = new Set(active.map((lane) => lane.column));
+        let nextColumn = 0;
+        while (usedColumns.has(nextColumn)) {
+          nextColumn++;
+        }
+
+        segment.column = nextColumn;
+        active.push({ endMinutes: segment.endMinutes, column: nextColumn });
+        cluster.push(segment);
+        clusterColumns = Math.max(clusterColumns, nextColumn + 1);
+      }
+
+      if (cluster.length > 0) {
+        flushCluster();
+      }
+    }
+
+    return segments;
+  }
+
+  function buildDayItemInlineStyle(item: RenderedAppointment): string {
+    const columns = Math.max(1, item.columnsCount);
+    const slotWidthPercent = 100 / columns;
+    const leftPercent = item.column * slotWidthPercent;
+    const expandedWidthPercent =
+      columns > 1 ? slotWidthPercent * (1 + DAY_EVENT_OVERLAP_RATIO) : slotWidthPercent;
+    const clampedWidthPercent = Math.min(expandedWidthPercent, 100 - leftPercent);
+    const zIndex = 10 + item.column;
+
+    return [
+      `top: ${item.top}px`,
+      `height: ${item.height}px`,
+      `left: calc(${leftPercent}% + ${DAY_EVENT_HORIZONTAL_INSET_PX}px)`,
+      `width: calc(${clampedWidthPercent}% - ${DAY_EVENT_HORIZONTAL_INSET_PX * 2}px)`,
+      `z-index: ${zIndex}`,
+      `background: ${hexToRgba(item.color, 0.2)}`,
+      `border-left: 4px solid ${item.color}`
+    ].join("; ");
+  }
+
+  function shouldShowDayItemTime(item: RenderedAppointment): boolean {
+    return item.height >= DAY_EVENT_MIN_HEIGHT_WITH_TIME && item.columnsCount <= DAY_EVENT_MAX_COLUMNS_WITH_TIME;
   }
 
   function buildMultiDayItems(source: Appointment[], week: Date[]): MultiDayAppointment[] {
@@ -1334,13 +1342,7 @@
 
 <div class="app-shell" data-theme="corporate">
   <div class="app-stage min-h-screen bg-base-200">
-  {#if toast}
-    <div class="toast toast-top toast-end z-50">
-      <div class="alert alert-info shadow">
-        <span>{toast}</span>
-      </div>
-    </div>
-  {/if}
+    <CalendarToast message={toast} />
 
   <!-- Drawer (Sidebar) -->
   <div class={`agenda-drawer drawer ${sidebarOpen ? "drawer-open lg:drawer-open" : ""}`}>
@@ -1348,43 +1350,11 @@
 
     <!-- Conteúdo -->
     <div class="drawer-content agenda-content flex flex-col">
-      <!-- Topbar -->
-      <header class="navbar agenda-topbar bg-base-100 border-b border-base-300 sticky top-0 z-40">
-        <div class="navbar-start gap-1 sm:gap-2">
-          <label for="agenda-drawer" class="menu-toggle-btn btn btn-ghost btn-circle" aria-label="Menu">
-        <svg viewBox="0 0 24 24" fill="none" aria-hidden="true">
-          <path d="M4 7h16M4 12h16M4 17h16" stroke="currentColor" stroke-width="1.9" stroke-linecap="round"></path>
-        </svg>
-          </label>
-
-          <div class="brand-lockup flex items-center gap-2">
-        <div class="gcal-mark" aria-hidden="true">
-          <span class="gcal-tab"></span>
-          <span class="gcal-day">{new Date().getDate()}</span>
-        </div>
-        <span class="brand-title text-lg font-semibold tracking-tight">Agenda</span>
-          </div>
-        </div>
-
-        <div class="navbar-center flex-1 hidden md:flex justify-center"></div>
-
-        <div class="navbar-end gap-2 lg:gap-3">
-          <button class="btn btn-sm today-btn hidden md:inline-flex" type="button" on:click={() => void goToday()}>Hoje</button>
-
-          <div class="week-nav hidden md:flex">
-        <button class="btn btn-sm btn-ghost week-nav-btn" type="button" aria-label="Semana anterior" on:click={() => void shiftWeek(-7)}>
-          ‹
-        </button>
-        <button class="btn btn-sm btn-ghost week-nav-btn" type="button" aria-label="Próxima semana" on:click={() => void shiftWeek(7)}>
-          ›
-        </button>
-          </div>
-
-          <h1 class="month-label text-base font-semibold text-base-content/80 hidden md:block">{monthTitle}</h1>
-
-          <button class="btn btn-sm today-btn md:hidden" type="button" on:click={() => void goToday()}>Hoje</button>
-        </div>
-      </header>
+      <CalendarTopbar
+        {monthTitle}
+        onGoToday={() => void goToday()}
+        onShiftWeek={(days) => void shiftWeek(days)}
+      />
 
       <div class="calendar-stage p-3 sm:p-4">
         <div
@@ -1415,143 +1385,149 @@
             class:opacity-100={edgeHint === "right" && !!draggingId}
           ></div>
 
-          <!-- Cabeçalho dias -->
-          <div class="week-header grid grid-cols-[72px_repeat(7,minmax(0,1fr))] border-b border-base-300 bg-base-100 sticky top-0 z-20">
-            <div class="week-timezone flex items-center justify-center text-xs font-medium text-base-content/60 py-2">
-              GMT-03
-            </div>
-
-            {#each weekDays as day (day.getTime())}
-            <div class="week-day-head flex flex-col items-center justify-center py-2 gap-0.5" class:today-col={sameDay(day, new Date())}>
-              <span class="week-day-label text-xs text-base-content/60">
-                {WEEKDAY_HEADER[day.getDay()]} </span>
-              <strong class="week-day-number text-sm">{day.getDate()}</strong>
-            </div>
-          {/each}
-          </div>
-
-          <!-- Multi-dia -->
-          {#if multiDayItems.length > 0 || multiDayDropPreview}
-            <div class="border-b border-base-300 bg-base-100" style={`height: ${multiDayStripHeight}px;`}>
-              <div class="grid grid-cols-[72px_1fr]">
-                <div class="p-2"></div>
-                <div
-                  class="p-2"
-                  role="region"
-                  aria-label="Faixa de eventos multi-dia"
-                  on:dragover={onMultiDayStripDragOver}
-                  on:drop={(ev) => void onMultiDayStripDrop(ev)}
-                >
-                  <div class="grid grid-cols-7 gap-2">
-                    {#each multiDayItems as item (`multi-${item.id}-${item.startDayIndex}-${item.endDayIndex}-${item.row}`)}
-                      <button
-                        type="button"
-                        class="event-pill multi-pill w-full text-left rounded-md border border-base-300 shadow-sm px-2 py-1 overflow-hidden transition
-                               hover:shadow-md hover:border-base-400"
-                        class:opacity-70={draggingId === item.id}
-                        class:animate-pulse={isSaving(item.id)}
-                        class:ring-2={selectedEventId === item.id}
-                        class:ring-primary={selectedEventId === item.id}
-                        style={`grid-column: ${item.startDayIndex + 1} / ${item.endDayIndex + 2}; grid-row: ${item.row + 1};
-                                background: ${hexToRgba(item.color, 0.2)}; border-left: 4px solid ${item.color};`}
-                        aria-label={`Editar compromisso multi-dia ${item.title}`}
-                        draggable={!isLocked(item.id) && item.canDrag}
-                        on:click|stopPropagation={(ev) => selectEvent(item, ev)}
-                        on:dragstart={(ev) => beginDrag(item, ev)}
-                        on:dragend={endDrag}
-                      >
-                        <div class="text-sm font-semibold truncate">{item.title}</div>
-                        <div class="text-xs text-base-content/70">{formatRange(item.startIso, item.endIso)}</div>
-                      </button>
-                    {/each}
-
-                    {#if multiDayDropPreview}
-                      <div
-                        class="event-pill multi-pill multi-day-drop-preview pointer-events-none w-full overflow-hidden px-2 py-1 text-left"
-                        style={`grid-column: ${multiDayDropPreview.startDayIndex + 1} / ${multiDayDropPreview.endDayIndex + 2}; grid-row: ${multiDayDropPreview.row + 1};
-                                background: ${hexToRgba(multiDayDropPreview.color, 0.22)}; border-left: 4px solid ${multiDayDropPreview.color};`}
-                      >
-                        <div class="text-sm font-semibold truncate">{multiDayDropPreview.title}</div>
-                      </div>
-                    {/if}
-                  </div>
+          <div class="week-main-scroll overflow-x-auto">
+            <div class="week-main-content min-w-full" style={`min-width: ${WEEK_CONTENT_MIN_WIDTH_PX}px;`}>
+              <!-- Cabeçalho dias -->
+              <div class="week-header grid grid-cols-[72px_repeat(7,minmax(0,1fr))] border-b border-base-300 bg-base-100 sticky top-0 z-20">
+                <div class="week-timezone flex items-center justify-center text-xs font-medium text-base-content/60 py-2">
+                  GMT-03
                 </div>
-              </div>
-            </div>
-          {/if}
 
-          <!-- Corpo -->
-          <div class="grid grid-cols-[72px_1fr]">
-            <!-- Coluna horas -->
-            <div class="hour-axis border-r border-base-300 bg-base-100">
-              {#each HOUR_ROWS as hour}
-                <div class="hour-slot h-12 flex items-start justify-end pr-2 pt-1 text-xs text-base-content/50">
-                  {hour > 0 ? `${pad2(hour)}:00` : ""}
+                {#each weekDays as day (day.getTime())}
+                <div class="week-day-head flex flex-col items-center justify-center py-2 gap-0.5" class:today-col={sameDay(day, new Date())}>
+                  <span class="week-day-label text-xs text-base-content/60">
+                    {WEEKDAY_HEADER[day.getDay()]} </span>
+                  <strong class="week-day-number text-sm">{day.getDate()}</strong>
                 </div>
               {/each}
-            </div>
+              </div>
 
-            <!-- Grade dias -->
-            <div class="week-grid-scroll relative overflow-auto" bind:this={gridScrollEl}>
-              <div class="relative" style={`height: ${DAY_HEIGHT}px;`}>
-                <!-- linhas de hora (repeating gradient) -->
-                <div
-                  class="absolute inset-0 pointer-events-none
-                         bg-[repeating-linear-gradient(to_bottom,hsl(var(--bc)/0.06)_0,hsl(var(--bc)/0.06)_1px,transparent_1px,transparent_48px)]"
-                ></div>
-
-                <div class="grid grid-cols-7 h-full">
-                  {#each weekDays as day, dayIndex (day.toISOString())}
+              <!-- Multi-dia -->
+              {#if multiDayItems.length > 0 || multiDayDropPreview}
+                <div class="border-b border-base-300 bg-base-100" style={`height: ${multiDayStripHeight}px;`}>
+                  <div class="grid grid-cols-[72px_1fr]">
+                    <div class="p-2"></div>
                     <div
-                      class="week-day-column relative h-full border-l border-base-300"
-                      class:today-grid-col={sameDay(day, new Date())}
-                      role="gridcell"
-                      tabindex="-1"
-                      aria-label={`Coluna ${WEEKDAY_HEADER[dayIndex]} ${day.getDate()}`}
-                      on:mousedown={(ev) => onDayColumnMouseDown(dayIndex, ev)}
-                      on:dragover={(ev) => onGridDragOver(dayIndex, ev)}
-                      on:drop={(ev) => void onGridDrop(dayIndex, ev)}
+                      class="p-2"
+                      role="region"
+                      aria-label="Faixa de eventos multi-dia"
+                      on:dragover={onMultiDayStripDragOver}
+                      on:drop={(ev) => void onMultiDayStripDrop(ev)}
                     >
-                      {#if dropPreview && dropPreview.dayIndex === dayIndex}
-                        <div
-                          class="drop-preview absolute left-1 right-1 rounded-lg border border-base-300 shadow-sm"
-                          style={`top: ${dropPreview.top}px; height: ${dropPreview.height}px;
-                                  background: ${hexToRgba(dropPreview.color, 0.2)}; border-color: ${dropPreview.color};`}
-                        ></div>
-                      {/if}
-
-                      {#if createSelectionPreview && createSelectionPreview.dayIndex === dayIndex}
-                        <div
-                          class="create-selection-preview absolute left-1 right-1 rounded-lg"
-                          style={`top: ${createSelectionPreview.top}px; height: ${createSelectionPreview.height}px;`}
-                        ></div>
-                      {/if}
-
-                      {#each itemsByDay[dayIndex] ?? [] as item (item.segmentKey)}
-                        <button
-                          type="button"
-                          class="event-pill day-pill absolute left-1 right-1 rounded-lg border border-base-300 shadow-sm px-2 py-1 text-left
-                                 transition hover:shadow-md hover:border-base-400
-                                 focus:outline-none focus:ring-2 focus:ring-primary"
-                          class:opacity-70={draggingId === item.id}
-                          class:animate-pulse={isSaving(item.id)}
-                          class:ring-2={selectedEventId === item.id}
-                          class:ring-primary={selectedEventId === item.id}
-                          aria-label={`Editar compromisso ${item.title}`}
-                          draggable={!isLocked(item.id) && item.canDrag}
-                          on:click|stopPropagation={(ev) => selectEvent(item, ev)}
-                          on:dragstart={(ev) => beginDrag(item, ev)}
-                          on:dragend={endDrag}
-                          style={`top: ${item.top}px; background: ${hexToRgba(item.color, 0.2)}; border-left: 4px solid ${item.color};`}
-                        >
-                          <div class="flex flex-col gap-0.5">
+                      <div class="grid grid-cols-7 gap-2">
+                        {#each multiDayItems as item (`multi-${item.id}-${item.startDayIndex}-${item.endDayIndex}-${item.row}`)}
+                          <button
+                            type="button"
+                            class="event-pill multi-pill w-full text-left rounded-md border border-base-300 shadow-sm px-2 py-1 overflow-hidden transition
+                                   hover:shadow-md hover:border-base-400"
+                            class:opacity-70={draggingId === item.id}
+                            class:animate-pulse={isSaving(item.id)}
+                            class:ring-2={selectedEventId === item.id}
+                            class:ring-primary={selectedEventId === item.id}
+                            style={`grid-column: ${item.startDayIndex + 1} / ${item.endDayIndex + 2}; grid-row: ${item.row + 1};
+                                    background: ${hexToRgba(item.color, 0.2)}; border-left: 4px solid ${item.color};`}
+                            aria-label={`Editar compromisso multi-dia ${item.title}`}
+                            draggable={!isLocked(item.id) && item.canDrag}
+                            on:click|stopPropagation={(ev) => selectEvent(item, ev)}
+                            on:dragstart={(ev) => beginDrag(item, ev)}
+                            on:dragend={endDrag}
+                          >
                             <div class="text-sm font-semibold truncate">{item.title}</div>
                             <div class="text-xs text-base-content/70">{formatRange(item.startIso, item.endIso)}</div>
+                          </button>
+                        {/each}
+
+                        {#if multiDayDropPreview}
+                          <div
+                            class="event-pill multi-pill multi-day-drop-preview pointer-events-none w-full overflow-hidden px-2 py-1 text-left"
+                            style={`grid-column: ${multiDayDropPreview.startDayIndex + 1} / ${multiDayDropPreview.endDayIndex + 2}; grid-row: ${multiDayDropPreview.row + 1};
+                                    background: ${hexToRgba(multiDayDropPreview.color, 0.22)}; border-left: 4px solid ${multiDayDropPreview.color};`}
+                          >
+                            <div class="text-sm font-semibold truncate">{multiDayDropPreview.title}</div>
                           </div>
-                        </button>
-                      {/each}
+                        {/if}
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              {/if}
+
+              <!-- Corpo -->
+              <div class="grid grid-cols-[72px_1fr]">
+                <!-- Coluna horas -->
+                <div class="hour-axis border-r border-base-300 bg-base-100">
+                  {#each HOUR_ROWS as hour}
+                    <div class="hour-slot h-12 flex items-start justify-end pr-2 pt-1 text-xs text-base-content/50">
+                      {hour > 0 ? `${pad2(hour)}:00` : ""}
                     </div>
                   {/each}
+                </div>
+
+                <!-- Grade dias -->
+                <div class="week-grid-scroll relative overflow-y-auto overflow-x-hidden" bind:this={gridScrollEl}>
+                  <div class="relative" style={`height: ${DAY_HEIGHT}px;`}>
+                    <!-- linhas de hora (repeating gradient) -->
+                    <div
+                      class="absolute inset-0 pointer-events-none
+                             bg-[repeating-linear-gradient(to_bottom,hsl(var(--bc)/0.06)_0,hsl(var(--bc)/0.06)_1px,transparent_1px,transparent_48px)]"
+                    ></div>
+
+                    <div class="grid grid-cols-7 h-full">
+                      {#each weekDays as day, dayIndex (day.toISOString())}
+                        <div
+                          class="week-day-column relative h-full border-l border-base-300"
+                          class:today-grid-col={sameDay(day, new Date())}
+                          role="gridcell"
+                          tabindex="-1"
+                          aria-label={`Coluna ${WEEKDAY_HEADER[dayIndex]} ${day.getDate()}`}
+                          on:mousedown={(ev) => onDayColumnMouseDown(dayIndex, ev)}
+                          on:dragover={(ev) => onGridDragOver(dayIndex, ev)}
+                          on:drop={(ev) => void onGridDrop(dayIndex, ev)}
+                        >
+                          {#if dropPreview && dropPreview.dayIndex === dayIndex}
+                            <div
+                              class="drop-preview absolute left-1 right-1 rounded-lg border border-base-300 shadow-sm"
+                              style={`top: ${dropPreview.top}px; height: ${dropPreview.height}px;
+                                      background: ${hexToRgba(dropPreview.color, 0.2)}; border-color: ${dropPreview.color};`}
+                            ></div>
+                          {/if}
+
+                          {#if createSelectionPreview && createSelectionPreview.dayIndex === dayIndex}
+                            <div
+                              class="create-selection-preview absolute left-1 right-1 rounded-lg"
+                              style={`top: ${createSelectionPreview.top}px; height: ${createSelectionPreview.height}px;`}
+                            ></div>
+                          {/if}
+
+                          {#each itemsByDay[dayIndex] ?? [] as item (item.segmentKey)}
+                            <button
+                              type="button"
+                              class="event-pill day-pill absolute overflow-hidden rounded-lg border border-base-300 shadow-sm px-2 py-1 text-left
+                                     transition hover:shadow-md hover:border-base-400
+                                     focus:outline-none focus:ring-2 focus:ring-primary"
+                              class:opacity-70={draggingId === item.id}
+                              class:animate-pulse={isSaving(item.id)}
+                              class:ring-2={selectedEventId === item.id}
+                              class:ring-primary={selectedEventId === item.id}
+                              aria-label={`Editar compromisso ${item.title}`}
+                              draggable={!isLocked(item.id) && item.canDrag}
+                              on:click|stopPropagation={(ev) => selectEvent(item, ev)}
+                              on:dragstart={(ev) => beginDrag(item, ev)}
+                              on:dragend={endDrag}
+                              style={buildDayItemInlineStyle(item)}
+                            >
+                              <div class="flex min-w-0 flex-col gap-0.5">
+                                <div class="truncate text-sm font-semibold leading-tight">{item.title}</div>
+                                {#if shouldShowDayItemTime(item)}
+                                  <div class="truncate text-xs text-base-content/70 leading-tight">{formatRange(item.startIso, item.endIso)}</div>
+                                {/if}
+                              </div>
+                            </button>
+                          {/each}
+                        </div>
+                      {/each}
+                    </div>
+                  </div>
                 </div>
               </div>
             </div>
@@ -1792,109 +1768,23 @@
       </div>
     </div>
 
-    <!-- Sidebar -->
-    <div class="drawer-side z-50">
-      <label for="agenda-drawer" class="drawer-overlay"></label>
-
-      <aside class="agenda-sidebar w-80 min-h-full bg-base-100 border-r border-base-300 p-4 space-y-4">
-        <!-- Criar -->
-        <div class="create-panel border border-base-300">
-          <button
-            class="create-pill-btn"
-            type="button"
-            aria-expanded={createOpen}
-            aria-controls="create-form-panel"
-            on:click={() => (createOpen = !createOpen)}
-          >
-            <span class="create-plus-mark" aria-hidden="true">+</span>
-            <span class="create-pill-label">Criar</span>
-            <span class="create-pill-caret" aria-hidden="true">▾</span>
-          </button>
-
-          {#if createOpen}
-            <div id="create-form-panel" class="create-form-wrap">
-              <form class="space-y-3" on:submit|preventDefault={() => void submit()}>
-                <label class="form-control">
-                  <div class="label"><span class="label-text">Título</span></div>
-                  <input class="input input-bordered input-sm" bind:value={title} placeholder="Ex: Reunião de status" required />
-                </label>
-
-                <label class="form-control">
-                  <div class="label"><span class="label-text">Início</span></div>
-                  <input class="input input-bordered input-sm" type="datetime-local" bind:value={startLocal} required />
-                </label>
-
-                <label class="form-control">
-                  <div class="label"><span class="label-text">Fim</span></div>
-                  <input class="input input-bordered input-sm" type="datetime-local" bind:value={endLocal} required />
-                </label>
-
-                <label class="form-control">
-                  <div class="label"><span class="label-text">Cor</span></div>
-                  <input class="h-10 w-full rounded-md border border-base-300 bg-base-100" type="color" bind:value={color} />
-                </label>
-
-                <label class="form-control">
-                  <div class="label"><span class="label-text">Repetição</span></div>
-                  <select class="select select-bordered select-sm" bind:value={recurrence}>
-                    {#each RECURRENCE_OPTIONS as option}
-                      <option value={option.value}>{option.label}</option>
-                    {/each}
-                  </select>
-                </label>
-
-                {#if recurrence !== "none"}
-                  <label class="form-control">
-                  <div class="label"><span class="label-text">Repetir até</span></div>
-                  <input class="input input-bordered input-sm" type="date" bind:value={recurrenceUntilLocal} required={true} />
-                  </label>
-                {/if}
-
-                <div class="pt-2">
-                  <button class="btn btn-primary btn-sm w-full" type="submit" disabled={loading}>
-                  Salvar compromisso
-                  </button>
-                </div>
-              </form>
-            </div>
-          {/if}
-        </div>
-
-        <!-- Mini calendário -->
-        <section class="mini-calendar-card card bg-base-100 border border-base-300 shadow-sm">
-          <div class="card-body p-4 gap-3">
-            <div class="mini-month-head flex items-center justify-between">
-              <button class="mini-month-btn" type="button" aria-label="Mês anterior" on:click={() => shiftMiniMonth(-1)}>
-                ‹
-              </button>
-              <strong class="mini-month-title text-sm">{miniMonthTitle}</strong>
-              <button class="mini-month-btn" type="button" aria-label="Próximo mês" on:click={() => shiftMiniMonth(1)}>
-                ›
-              </button>
-            </div>
-
-            <div class="grid grid-cols-7 gap-1 text-center">
-              {#each MINI_WEEKDAY_HEADER as dayName}
-                <div class="mini-weekday text-[11px] font-medium text-base-content/60">{dayName}</div>
-              {/each}
-
-              {#each miniDays as day}
-                <button
-                  type="button"
-                  class="mini-day-btn"
-                  class:is-today={day.isToday}
-                  class:is-week={day.inCurrentWeek && !day.isToday}
-                  class:is-outside={!day.inMonth}
-                  on:click={() => void pickMiniDay(day)}
-                >
-                  {day.date.getDate()}
-                </button>
-              {/each}
-            </div>
-          </div>
-        </section>
-      </aside>
-    </div>
+    <CalendarSidebar
+      bind:createOpen
+      bind:title
+      bind:startLocal
+      bind:endLocal
+      bind:color
+      bind:recurrence
+      bind:recurrenceUntilLocal
+      {loading}
+      recurrenceOptions={RECURRENCE_OPTIONS}
+      {miniMonthTitle}
+      miniWeekdayHeader={MINI_WEEKDAY_HEADER}
+      {miniDays}
+      onSubmit={() => void submit()}
+      onShiftMiniMonth={shiftMiniMonth}
+      onPickMiniDay={(day) => void pickMiniDay(day)}
+    />
   </div>
 </div>
 
