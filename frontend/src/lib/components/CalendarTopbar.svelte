@@ -1,5 +1,6 @@
 <script lang="ts">
   export let monthTitle = "";
+  export let weekLabel = "";
   export let todayDate = new Date().getDate();
   export let onGoToday: () => void = () => {};
   export let onShiftWeek: (days: number) => void = () => {};
@@ -28,15 +29,29 @@
     <button class="btn btn-sm today-btn hidden md:inline-flex" type="button" on:click={onGoToday}>Hoje</button>
 
     <div class="week-nav hidden md:flex">
-      <button class="btn btn-sm btn-ghost week-nav-btn" type="button" aria-label="Semana anterior" on:click={() => onShiftWeek(-7)}>
+      <button
+        class="btn btn-sm btn-ghost week-nav-btn"
+        data-testid="week-prev"
+        type="button"
+        aria-label="Semana anterior"
+        on:click={() => onShiftWeek(-7)}
+      >
         ‹
       </button>
-      <button class="btn btn-sm btn-ghost week-nav-btn" type="button" aria-label="Próxima semana" on:click={() => onShiftWeek(7)}>
+      <button
+        class="btn btn-sm btn-ghost week-nav-btn"
+        data-testid="week-next"
+        type="button"
+        aria-label="Próxima semana"
+        on:click={() => onShiftWeek(7)}
+      >
         ›
       </button>
     </div>
 
-    <h1 class="month-label text-base font-semibold text-base-content/80 hidden md:block">{monthTitle}</h1>
+    <h1 class="month-label text-base font-semibold text-base-content/80 hidden md:block" data-testid="week-label">
+      {weekLabel || monthTitle}
+    </h1>
 
     <button class="btn btn-sm today-btn md:hidden" type="button" on:click={onGoToday}>Hoje</button>
   </div>

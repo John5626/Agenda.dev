@@ -45,22 +45,45 @@
             <form class="space-y-3" on:submit|preventDefault={onSubmit}>
               <label class="form-control">
                 <div class="label"><span class="label-text">Título</span></div>
-                <input class="input input-bordered input-sm" bind:value={title} placeholder="Ex: Reunião de status" required />
+                <input
+                  class="input input-bordered input-sm"
+                  data-testid="appt-title"
+                  bind:value={title}
+                  placeholder="Ex: Reunião de status"
+                  required
+                />
               </label>
 
               <label class="form-control">
                 <div class="label"><span class="label-text">Início</span></div>
-                <input class="input input-bordered input-sm" type="datetime-local" bind:value={startLocal} required />
+                <input
+                  class="input input-bordered input-sm"
+                  data-testid="appt-start"
+                  type="datetime-local"
+                  bind:value={startLocal}
+                  required
+                />
               </label>
 
               <label class="form-control">
                 <div class="label"><span class="label-text">Fim</span></div>
-                <input class="input input-bordered input-sm" type="datetime-local" bind:value={endLocal} required />
+                <input
+                  class="input input-bordered input-sm"
+                  data-testid="appt-end"
+                  type="datetime-local"
+                  bind:value={endLocal}
+                  required
+                />
               </label>
 
               <label class="form-control">
                 <div class="label"><span class="label-text">Cor</span></div>
-                <input class="h-10 w-full rounded-md border border-base-300 bg-base-100" type="color" bind:value={color} />
+                <input
+                  class="h-10 w-full rounded-md border border-base-300 bg-base-100"
+                  data-testid="appt-color"
+                  type="color"
+                  bind:value={color}
+                />
               </label>
 
               <label class="form-control">
@@ -80,7 +103,9 @@
               {/if}
 
               <div class="pt-2">
-                <button class="btn btn-primary btn-sm w-full" type="submit" disabled={loading}>Salvar compromisso</button>
+                <button class="btn btn-primary btn-sm w-full" data-testid="appt-submit" type="submit" disabled={loading}>
+                  Salvar compromisso
+                </button>
               </div>
             </form>
           </div>

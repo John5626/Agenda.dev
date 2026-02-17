@@ -21,6 +21,7 @@
     buildWeekDays,
     formatMiniMonthTitle,
     formatMonthTitle,
+    MONTHS_SHORT,
     MINI_WEEKDAY_HEADER,
     startOfWeekSunday,
     type MiniDay,
@@ -148,6 +149,7 @@
   let miniDays: MiniDay[] = [];
 
   let monthTitle = "";
+  let weekLabel = "";
   let miniMonthTitle = "";
 
   let renderedItems: RenderedAppointment[] = [];
@@ -211,6 +213,7 @@
   $: weekDays = buildWeekDays(weekStart);
   $: resolvedTheme = resolveAgendaTheme(themePreference, systemPrefersDark);
   $: monthTitle = formatMonthTitle(weekAnchor);
+  $: weekLabel = formatWeekLabel(weekDays);
   $: miniMonthTitle = formatMiniMonthTitle(miniMonthCursor);
   $: miniDays = buildMiniDays(miniMonthCursor, weekStart);
   $: renderedItems = buildRenderedItems(items, weekDays);
@@ -241,6 +244,41 @@
   );
   $: renderedById = new Map(items.filter((item) => !!item.id).map((item) => [item.id!, item]));
   $: selectedItem = selectedEventId ? renderedById.get(selectedEventId) ?? null : null;
+
+  function formatLocalDateKey(date: Date): string {
+    return `${date.getFullYear()}-${pad2(date.getMonth() + 1)}-${pad2(date.getDate())}`;
+  }
+
+  function formatLocalDateTimeKey(date: Date): string {
+    return `${formatLocalDateKey(date)}T${pad2(date.getHours())}:${pad2(date.getMinutes())}`;
+  }
+
+  function formatShortMonth(date: Date): string {
+    return `${MONTHS_SHORT[date.getMonth()]}.`;
+  }
+
+  function formatWeekLabel(week: Date[]): string {
+    if (week.length < 2) return "";
+    const start = week[0];
+    const end = week[week.length - 1];
+    const sameMonthAndYear = start.getMonth() === end.getMonth() && start.getFullYear() === end.getFullYear();
+    if (sameMonthAndYear) return `${formatShortMonth(start)} ${start.getFullYear()}`;
+
+    const sameYear = start.getFullYear() === end.getFullYear();
+    if (sameYear) return `${formatShortMonth(start)} - ${formatShortMonth(end)} ${start.getFullYear()}`;
+
+    return `${formatShortMonth(start)} ${start.getFullYear()} - ${formatShortMonth(end)} ${end.getFullYear()}`;
+  }
+
+  function toSlotTestId(day: Date, hour: number): string {
+    return `slot-${formatLocalDateKey(day)}T${pad2(hour)}:00`;
+  }
+
+  function toEventSlotFromIso(iso: string): string {
+    const date = new Date(iso);
+    if (Number.isNaN(date.getTime())) return "";
+    return formatLocalDateTimeKey(date);
+  }
 
   function showToast(message: string) {
     toast = message;
@@ -1402,6 +1440,7 @@
     <div class="drawer-content agenda-content flex flex-col">
       <CalendarTopbar
         {monthTitle}
+        {weekLabel}
         onGoToday={() => void goToday()}
         onShiftWeek={(days) => void shiftWeek(days)}
       />
@@ -1411,6 +1450,7 @@
           class="card calendar-frame bg-base-100 shadow-sm border border-base-300 overflow-hidden"
           class:slide-next={weekSlideDirection === "next"}
           class:slide-prev={weekSlideDirection === "prev"}
+          data-testid="calendar-frame"
           role="group"
           aria-label="Calendário semanal"
           bind:this={calendarPanelEl}
@@ -1468,12 +1508,18 @@
                         {#each multiDayItems as item (`multi-${item.id}-${item.startDayIndex}-${item.endDayIndex}-${item.row}`)}
                           <button
                             type="button"
-                            class="event-pill multi-pill w-full text-left rounded-md border border-base-300 shadow-sm px-2 py-1 overflow-hidden transition
+                            class="event-pill event-item multi-pill w-full text-left rounded-md border border-base-300 shadow-sm px-2 py-1 overflow-hidden transition
                                    hover:shadow-md hover:border-base-400"
                             class:opacity-70={draggingId === item.id}
                             class:animate-pulse={isSaving(item.id)}
                             class:ring-2={selectedEventId === item.id}
                             class:ring-primary={selectedEventId === item.id}
+                            data-testid="event-item"
+                            data-id={item.id}
+                            data-start={item.startIso}
+                            data-end={item.endIso}
+                            data-slot={toEventSlotFromIso(item.startIso)}
+                            data-color={item.color}
                             style={`grid-column: ${item.startDayIndex + 1} / ${item.endDayIndex + 2}; grid-row: ${item.row + 1};
                                     background: ${hexToRgba(item.color, 0.2)}; border-left: 4px solid ${item.color};`}
                             aria-label={`Editar compromisso multi-dia ${item.title}`}
@@ -1482,8 +1528,17 @@
                             on:dragstart={(ev) => beginDrag(item, ev)}
                             on:dragend={endDrag}
                           >
-                            <div class="text-sm font-semibold truncate">{item.title}</div>
-                            <div class="text-xs text-base-content/70">{formatRange(item.startIso, item.endIso)}</div>
+                            <div
+                              class="min-w-0"
+                              data-testid="appt-item"
+                              data-id={item.id}
+                              data-start={item.startIso}
+                              data-slot={toEventSlotFromIso(item.startIso)}
+                              data-color={item.color}
+                            >
+                              <div class="text-sm font-semibold truncate">{item.title}</div>
+                              <div class="text-xs text-base-content/70">{formatRange(item.startIso, item.endIso)}</div>
+                            </div>
                           </button>
                         {/each}
 
@@ -1527,6 +1582,7 @@
                         <div
                           class="week-day-column relative h-full border-l border-base-300"
                           class:today-grid-col={sameDay(day, new Date())}
+                          data-day={formatLocalDateKey(day)}
                           role="gridcell"
                           tabindex="-1"
                           aria-label={`Coluna ${WEEKDAY_HEADER[dayIndex]} ${day.getDate()}`}
@@ -1534,6 +1590,16 @@
                           on:dragover={(ev) => onGridDragOver(dayIndex, ev)}
                           on:drop={(ev) => void onGridDrop(dayIndex, ev)}
                         >
+                          {#each HOUR_ROWS as hour}
+                            <div
+                              class="absolute left-0 right-0 h-12"
+                              data-testid={toSlotTestId(day, hour)}
+                              data-slot={`${formatLocalDateKey(day)}T${pad2(hour)}:00`}
+                              style={`top: ${hour * HOUR_HEIGHT}px;`}
+                              aria-hidden="true"
+                            ></div>
+                          {/each}
+
                           {#if dropPreview && dropPreview.dayIndex === dayIndex}
                             <div
                               class="drop-preview absolute left-1 right-1 rounded-lg border border-base-300 shadow-sm"
@@ -1552,13 +1618,19 @@
                           {#each itemsByDay[dayIndex] ?? [] as item (item.segmentKey)}
                             <button
                               type="button"
-                              class="event-pill day-pill absolute overflow-hidden rounded-lg border border-base-300 shadow-sm px-2 py-1 text-left
+                              class="event-pill event-item day-pill absolute overflow-hidden rounded-lg border border-base-300 shadow-sm px-2 py-1 text-left
                                      transition hover:shadow-md hover:border-base-400
                                      focus:outline-none focus:ring-2 focus:ring-primary"
                               class:opacity-70={draggingId === item.id}
                               class:animate-pulse={isSaving(item.id)}
                               class:ring-2={selectedEventId === item.id}
                               class:ring-primary={selectedEventId === item.id}
+                              data-testid="event-item"
+                              data-id={item.id}
+                              data-start={item.startIso}
+                              data-end={item.endIso}
+                              data-slot={toEventSlotFromIso(item.startIso)}
+                              data-color={item.color}
                               aria-label={`Editar compromisso ${item.title}`}
                               draggable={!isLocked(item.id) && item.canDrag}
                               on:click|stopPropagation={(ev) => selectEvent(item, ev)}
@@ -1566,7 +1638,14 @@
                               on:dragend={endDrag}
                               style={buildDayItemInlineStyle(item)}
                             >
-                              <div class="flex min-w-0 flex-col gap-0.5">
+                              <div
+                                class="flex min-w-0 flex-col gap-0.5"
+                                data-testid="appt-item"
+                                data-id={item.id}
+                                data-start={item.startIso}
+                                data-slot={toEventSlotFromIso(item.startIso)}
+                                data-color={item.color}
+                              >
                                 <div class="truncate text-sm font-semibold leading-tight">{item.title}</div>
                                 {#if shouldShowDayItemTime(item)}
                                   <div class="truncate text-xs text-base-content/70 leading-tight">{formatRange(item.startIso, item.endIso)}</div>
@@ -1745,11 +1824,23 @@
                 <div class="flex items-center gap-2 justify-between">
                   <label class="flex items-center gap-2">
                     <span class="text-xs text-base-content/70">Cor</span>
-                    <input class="h-8 w-10 rounded-md border border-base-300 bg-base-100" type="color" bind:value={editColor} disabled={isLocked(selectedEventId)} />
+                    <input
+                      class="h-8 w-10 rounded-md border border-base-300 bg-base-100"
+                      data-testid="appt-color-edit"
+                      type="color"
+                      bind:value={editColor}
+                      disabled={isLocked(selectedEventId)}
+                    />
                   </label>
 
                   <div class="flex gap-2">
-                    <button class="btn btn-error btn-sm" type="button" disabled={isLocked(selectedEventId)} on:click={() => void removeSelected()}>
+                    <button
+                      class="btn btn-error btn-sm"
+                      data-testid="appt-delete"
+                      type="button"
+                      disabled={isLocked(selectedEventId)}
+                      on:click={() => void removeSelected()}
+                    >
                       Excluir
                     </button>
                     <button class="btn btn-primary btn-sm" type="button" disabled={isLocked(selectedEventId)} on:click={() => void saveSelectedEdit()}>

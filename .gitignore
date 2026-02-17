@@ -2,3 +2,5 @@ AGENT_RULES.md
 DECISIONS.md
 FRONTEND.md
 agendaLikeGoogleCalendar.sln
+node_modules/
+test-results/
