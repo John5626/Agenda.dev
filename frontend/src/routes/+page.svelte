@@ -26,6 +26,13 @@
     type MiniDay,
     WEEKDAY_HEADER
   } from "$lib/utils/week";
+  import {
+    parseThemePreference,
+    resolveAgendaTheme,
+    THEME_STORAGE_KEY,
+    type AgendaTheme,
+    type ThemePreference
+  } from "$lib/utils/theme";
 
   const HOUR_HEIGHT = 48;
   const DAY_MINUTES = 24 * 60;
@@ -120,6 +127,9 @@
   let error = "";
   let toast = "";
   let toastTimer: ReturnType<typeof setTimeout> | undefined;
+  let themePreference: ThemePreference = "system";
+  let systemPrefersDark = false;
+  let resolvedTheme: AgendaTheme = "corporate";
 
   let title = "";
   let startLocal = "";
@@ -199,6 +209,7 @@
   let calendarPanelEl: HTMLElement | null = null;
 
   $: weekDays = buildWeekDays(weekStart);
+  $: resolvedTheme = resolveAgendaTheme(themePreference, systemPrefersDark);
   $: monthTitle = formatMonthTitle(weekAnchor);
   $: miniMonthTitle = formatMiniMonthTitle(miniMonthCursor);
   $: miniDays = buildMiniDays(miniMonthCursor, weekStart);
@@ -235,6 +246,25 @@
     toast = message;
     if (toastTimer) clearTimeout(toastTimer);
     toastTimer = setTimeout(() => (toast = ""), 2600);
+  }
+
+  function persistThemePreference(preference: ThemePreference) {
+    if (typeof window === "undefined") return;
+    try {
+      window.localStorage.setItem(THEME_STORAGE_KEY, preference);
+    } catch {
+      // Ignora bloqueio de storage (modo privado/políticas).
+    }
+  }
+
+  function setThemePreference(preference: ThemePreference) {
+    themePreference = preference;
+    persistThemePreference(preference);
+  }
+
+  function toggleThemePreference() {
+    const nextPreference: ThemePreference = resolvedTheme === "night" ? "light" : "dark";
+    setThemePreference(nextPreference);
   }
 
   function isMultiDaySpan(startIso: string, endIso: string) {
@@ -1330,17 +1360,37 @@
     await persistDraggedMove(id, item, nextStart, nextEnd);
   }
 
-  onMount(async () => {
-    setCreateDefaults();
-    await load();
-    await tick();
-    if (gridScrollEl) gridScrollEl.scrollTop = HOUR_HEIGHT * 6;
+  onMount(() => {
+    const mediaQuery = window.matchMedia("(prefers-color-scheme: dark)");
+    systemPrefersDark = mediaQuery.matches;
+    try {
+      themePreference = parseThemePreference(window.localStorage.getItem(THEME_STORAGE_KEY));
+    } catch {
+      themePreference = "system";
+    }
+
+    const onSystemThemeChange = (event: MediaQueryListEvent) => {
+      systemPrefersDark = event.matches;
+    };
+
+    mediaQuery.addEventListener("change", onSystemThemeChange);
+
+    void (async () => {
+      setCreateDefaults();
+      await load();
+      await tick();
+      if (gridScrollEl) gridScrollEl.scrollTop = HOUR_HEIGHT * 6;
+    })();
+
+    return () => {
+      mediaQuery.removeEventListener("change", onSystemThemeChange);
+    };
   });
 </script>
 
 <svelte:window on:mousemove={onWindowMouseMove} on:mouseup={onWindowMouseUp} />
 
-<div class="app-shell" data-theme="corporate">
+<div class="app-shell" data-theme={resolvedTheme}>
   <div class="app-stage min-h-screen bg-base-200">
     <CalendarToast message={toast} />
 
@@ -1781,9 +1831,11 @@
       {miniMonthTitle}
       miniWeekdayHeader={MINI_WEEKDAY_HEADER}
       {miniDays}
+      {resolvedTheme}
       onSubmit={() => void submit()}
       onShiftMiniMonth={shiftMiniMonth}
       onPickMiniDay={(day) => void pickMiniDay(day)}
+      onToggleTheme={toggleThemePreference}
     />
   </div>
 </div>
