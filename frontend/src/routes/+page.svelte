@@ -21,12 +21,16 @@
     "Dezembro"
   ];
 
-  const HOUR_HEIGHT = 56;
+  const HOUR_HEIGHT = 48;
   const DAY_MINUTES = 24 * 60;
   const DAY_HEIGHT = 24 * HOUR_HEIGHT;
   const SNAP_MINUTES = 15;
   const PX_PER_MINUTE = HOUR_HEIGHT / 60;
   const HOUR_ROWS = Array.from({ length: 24 }, (_, idx) => idx);
+  const MULTI_DAY_ROW_HEIGHT = 36;
+  const MULTI_DAY_ROW_GAP = 8;
+  const MULTI_DAY_VERTICAL_PADDING = 16;
+  const MULTI_DAY_MIN_HEIGHT = 44;
   const EDGE_SWITCH_THRESHOLD = 64;
   const EDGE_SWITCH_DELAY_MS = 420;
   const RECURRENCE_OPTIONS: { value: Recurrence; label: string }[] = [
@@ -90,6 +94,15 @@
     recurrenceUntilIso: string | null;
     seriesId: string | null;
     durationMs: number;
+    isMultiDay: boolean;
+  };
+
+  type CreateSelectionPreview = {
+    dayIndex: number;
+    startMinutes: number;
+    endMinutes: number;
+    top: number;
+    height: number;
   };
 
   let items: Appointment[] = [];
@@ -120,6 +133,8 @@
   let renderedItems: RenderedAppointment[] = [];
   let multiDayItems: MultiDayAppointment[] = [];
   let multiDayRows = 0;
+  let multiDayRenderRows = 0;
+  let multiDayStripHeight = MULTI_DAY_MIN_HEIGHT;
   let itemsByDay: RenderedAppointment[][] = Array.from({ length: 7 }, () => []);
   let renderedById = new Map<string, Appointment>();
   let selectedItem: Appointment | null = null;
@@ -136,6 +151,18 @@
   let deleteModalOpen = false;
   let deleteScope: DeleteScope = "single";
 
+  let createEditorOpen = false;
+  let createEditorTop = 14;
+  let createEditorLeft = 14;
+  let createDraftTitle = "";
+  let createDraftStartLocal = "";
+  let createDraftEndLocal = "";
+  let createDraftColor = "#3b82f6";
+  let createDraftRecurrence: Recurrence = "none";
+  let createDraftRecurrenceUntilLocal = "";
+  let createDraftError = "";
+  let savingCreate = false;
+
   let deletingId = "";
   let savingEditId = "";
   let savingDragId = "";
@@ -149,6 +176,14 @@
   let weekSlideTimer: ReturnType<typeof setTimeout> | undefined;
 
   let dropPreview: { dayIndex: number; top: number; height: number; color: string } | null = null;
+  let multiDayDropPreview: { startDayIndex: number; endDayIndex: number; row: number; color: string; title: string } | null = null;
+  let createSelectionPreview: CreateSelectionPreview | null = null;
+  let creatingBySelection = false;
+  let createSelectionDayIndex = -1;
+  let createSelectionStartMinutes = 0;
+  let createSelectionColumnEl: HTMLElement | null = null;
+  let createSelectionStartClientY = 0;
+  let createSelectionHasDragged = false;
 
   let gridScrollEl: HTMLDivElement | null = null;
   let calendarPanelEl: HTMLElement | null = null;
@@ -160,6 +195,19 @@
   $: renderedItems = buildRenderedItems(items, weekDays);
   $: multiDayItems = buildMultiDayItems(items, weekDays);
   $: multiDayRows = multiDayItems.reduce((max, item) => Math.max(max, item.row + 1), 0);
+  $: {
+    const previewRows = multiDayDropPreview ? multiDayDropPreview.row + 1 : 0;
+    multiDayRenderRows = Math.max(multiDayRows, previewRows);
+  }
+  $: multiDayStripHeight =
+    multiDayRenderRows > 0
+      ? Math.max(
+          MULTI_DAY_MIN_HEIGHT,
+          multiDayRenderRows * MULTI_DAY_ROW_HEIGHT +
+            Math.max(0, multiDayRenderRows - 1) * MULTI_DAY_ROW_GAP +
+            MULTI_DAY_VERTICAL_PADDING
+        )
+      : MULTI_DAY_MIN_HEIGHT;
   $: itemsByDay = Array.from({ length: 7 }, (_, dayIndex) =>
     renderedItems.filter((item) => item.dayIndex === dayIndex)
   );
@@ -238,6 +286,103 @@
     const start = new Date(startIso);
     const end = new Date(endIso);
     return `${pad2(start.getHours())}:${pad2(start.getMinutes())} - ${pad2(end.getHours())}:${pad2(end.getMinutes())}`;
+  }
+
+  function isMultiDaySpan(startIso: string, endIso: string) {
+    const start = new Date(startIso);
+    const end = new Date(endIso);
+    if (Number.isNaN(start.getTime()) || Number.isNaN(end.getTime())) return false;
+    return !sameDay(start, end);
+  }
+
+  function resolveActiveDragMeta(id: string): DragMeta | null {
+    if (dragMeta && dragMeta.id === id) return dragMeta;
+
+    const base = renderedById.get(id);
+    if (!base?.id) return null;
+
+    return {
+      id: base.id,
+      title: base.title,
+      color: base.color,
+      startIso: base.start,
+      endIso: base.end,
+      recurrence: base.recurrence ?? "none",
+      recurrenceUntilIso: base.recurrenceUntil ?? null,
+      seriesId: base.seriesId ?? null,
+      durationMs: Math.max(15 * 60_000, new Date(base.end).getTime() - new Date(base.start).getTime()),
+      isMultiDay: isMultiDaySpan(base.start, base.end)
+    } satisfies DragMeta;
+  }
+
+  function resolveMultiDayRow(startDayIndex: number, endDayIndex: number, excludedId: string) {
+    let row = 0;
+
+    while (
+      multiDayItems.some(
+        (item) =>
+          item.id !== excludedId &&
+          item.row === row &&
+          !(item.endDayIndex < startDayIndex || item.startDayIndex > endDayIndex)
+      )
+    ) {
+      row++;
+    }
+
+    return row;
+  }
+
+  function resolveMultiDayPlacement(item: DragMeta, dayIndex: number) {
+    if (weekDays.length !== 7) return null;
+
+    const originalStart = new Date(item.startIso);
+    if (Number.isNaN(originalStart.getTime())) return null;
+
+    const nextStart = new Date(weekDays[dayIndex]);
+    nextStart.setHours(
+      originalStart.getHours(),
+      originalStart.getMinutes(),
+      originalStart.getSeconds(),
+      originalStart.getMilliseconds()
+    );
+    const nextEnd = new Date(nextStart.getTime() + item.durationMs);
+
+    const visibleWeekStart = new Date(weekDays[0]);
+    visibleWeekStart.setHours(0, 0, 0, 0);
+    const visibleWeekEnd = new Date(visibleWeekStart);
+    visibleWeekEnd.setDate(visibleWeekEnd.getDate() + 7);
+
+    if (nextEnd <= visibleWeekStart || nextStart >= visibleWeekEnd) return null;
+
+    const visibleStart = nextStart > visibleWeekStart ? nextStart : visibleWeekStart;
+    const visibleEnd = nextEnd < visibleWeekEnd ? nextEnd : visibleWeekEnd;
+    const visibleEndInclusive = new Date(visibleEnd.getTime() - 1);
+
+    const spanStartDay = new Date(visibleStart);
+    spanStartDay.setHours(0, 0, 0, 0);
+    const spanEndDay = new Date(visibleEndInclusive);
+    spanEndDay.setHours(0, 0, 0, 0);
+
+    const startDayIndex = clamp(
+      Math.round((spanStartDay.getTime() - visibleWeekStart.getTime()) / ONE_DAY_MS),
+      0,
+      6
+    );
+    const endDayIndex = clamp(
+      Math.round((spanEndDay.getTime() - visibleWeekStart.getTime()) / ONE_DAY_MS),
+      0,
+      6
+    );
+
+    if (endDayIndex < startDayIndex) return null;
+
+    return {
+      startDayIndex,
+      endDayIndex,
+      row: resolveMultiDayRow(startDayIndex, endDayIndex, item.id),
+      nextStart,
+      nextEnd
+    };
   }
 
   function setCreateDefaults(base = new Date()) {
@@ -484,6 +629,7 @@
       setWeekWithoutLoad(currentDirection * 7);
       playWeekSlide(currentDirection === 1 ? "next" : "prev");
       dropPreview = null;
+      multiDayDropPreview = null;
     }, EDGE_SWITCH_DELAY_MS);
   }
 
@@ -557,6 +703,211 @@
     }
   }
 
+  function closeCreateEditor() {
+    createEditorOpen = false;
+    createDraftError = "";
+  }
+
+  function resolveSnappedMinutesFromClientY(clientY: number, columnEl: HTMLElement) {
+    const rect = columnEl.getBoundingClientRect();
+    const rawMinutes = (clientY - rect.top) / PX_PER_MINUTE;
+    const snappedMinutes = Math.round(rawMinutes / SNAP_MINUTES) * SNAP_MINUTES;
+    return clamp(snappedMinutes, 0, DAY_MINUTES - SNAP_MINUTES);
+  }
+
+  function buildCreateSelectionPreview(dayIndex: number, startMinutes: number, currentMinutes: number): CreateSelectionPreview {
+    const from = clamp(Math.min(startMinutes, currentMinutes), 0, DAY_MINUTES - SNAP_MINUTES);
+    const to = clamp(Math.max(startMinutes, currentMinutes) + SNAP_MINUTES, SNAP_MINUTES, DAY_MINUTES);
+    const durationMinutes = Math.max(SNAP_MINUTES, to - from);
+
+    return {
+      dayIndex,
+      startMinutes: from,
+      endMinutes: to,
+      top: from * PX_PER_MINUTE,
+      height: durationMinutes * PX_PER_MINUTE
+    };
+  }
+
+  function clearCreateSelectionState() {
+    creatingBySelection = false;
+    createSelectionDayIndex = -1;
+    createSelectionStartMinutes = 0;
+    createSelectionColumnEl = null;
+    createSelectionStartClientY = 0;
+    createSelectionHasDragged = false;
+    createSelectionPreview = null;
+  }
+
+  function positionCreateEditorFromSelection(columnEl: HTMLElement, startMinutes: number, endMinutes: number) {
+    if (!calendarPanelEl) return;
+
+    const panelRect = calendarPanelEl.getBoundingClientRect();
+    const columnRect = columnEl.getBoundingClientRect();
+    const horizontalGap = 10;
+    const safeGap = 12;
+
+    let left = columnRect.right - panelRect.left + horizontalGap;
+    if (left + MAX_EDITOR_WIDTH > panelRect.width - safeGap) {
+      left = columnRect.left - panelRect.left - MAX_EDITOR_WIDTH - horizontalGap;
+    }
+
+    left = clamp(left, safeGap, Math.max(safeGap, panelRect.width - MAX_EDITOR_WIDTH - safeGap));
+
+    const selectionMidOffset = ((startMinutes + endMinutes) / 2) * PX_PER_MINUTE;
+    const estimatedEditorHeight = EDITOR_VERTICAL_FALLBACK;
+    const maxTop = Math.max(safeGap, panelRect.height - estimatedEditorHeight);
+    const top = clamp(selectionMidOffset - estimatedEditorHeight / 2, safeGap, maxTop);
+
+    createEditorLeft = left;
+    createEditorTop = top;
+  }
+
+  function openCreateEditorFromSelection(
+    dayIndex: number,
+    startMinutes: number,
+    endMinutes: number,
+    columnEl: HTMLElement
+  ) {
+    const start = new Date(weekDays[dayIndex]);
+    start.setHours(0, 0, 0, 0);
+    start.setMinutes(startMinutes);
+
+    const end = new Date(weekDays[dayIndex]);
+    end.setHours(0, 0, 0, 0);
+    end.setMinutes(endMinutes);
+
+    if (end.getTime() <= start.getTime()) {
+      end.setTime(start.getTime() + SNAP_MINUTES * 60_000);
+    }
+
+    createDraftTitle = "";
+    createDraftStartLocal = toLocalInputValue(start);
+    createDraftEndLocal = toLocalInputValue(end);
+    createDraftColor = color;
+    createDraftRecurrence = "none";
+    createDraftRecurrenceUntilLocal = "";
+    createDraftError = "";
+    createEditorOpen = true;
+
+    closeEditor();
+    positionCreateEditorFromSelection(columnEl, startMinutes, endMinutes);
+  }
+
+  async function saveCreateFromEditor() {
+    createDraftError = "";
+
+    const trimmedTitle = createDraftTitle.trim();
+    if (!trimmedTitle) {
+      createDraftError = "Titulo obrigatorio.";
+      return;
+    }
+
+    if (!createDraftStartLocal || !createDraftEndLocal) {
+      createDraftError = "Preencha inicio e fim.";
+      return;
+    }
+
+    if (createDraftRecurrence !== "none" && !createDraftRecurrenceUntilLocal) {
+      createDraftError = "Para repeticao, preencha ate quando repetir.";
+      return;
+    }
+
+    const startDate = new Date(createDraftStartLocal);
+    const endDate = new Date(createDraftEndLocal);
+    if (Number.isNaN(startDate.getTime()) || Number.isNaN(endDate.getTime())) {
+      createDraftError = "Data/hora invalida.";
+      return;
+    }
+
+    if (endDate.getTime() <= startDate.getTime()) {
+      createDraftError = "Fim deve ser maior que inicio.";
+      return;
+    }
+
+    savingCreate = true;
+    error = "";
+
+    try {
+      await createAppointment({
+        title: trimmedTitle,
+        start: toUtcIso(createDraftStartLocal),
+        end: toUtcIso(createDraftEndLocal),
+        color: createDraftColor,
+        recurrence: createDraftRecurrence,
+        recurrenceUntil:
+          createDraftRecurrence === "none" ? null : toUtcIsoEndOfDay(createDraftRecurrenceUntilLocal)
+      });
+      closeCreateEditor();
+      showToast("Compromisso criado e salvo");
+      await load();
+    } catch (e: any) {
+      createDraftError = e?.message ?? "Falha ao salvar compromisso";
+    } finally {
+      savingCreate = false;
+    }
+  }
+
+  function onDayColumnMouseDown(dayIndex: number, ev: MouseEvent) {
+    if (ev.button !== 0) return;
+    if (draggingId || savingDragId || savingEditId || deletingId || savingCreate) return;
+
+    const target = ev.target as HTMLElement | null;
+    if (!target) return;
+    if (target.closest(".event-pill")) return;
+    if (target.closest(".event-editor")) return;
+    if (target.closest("input, textarea, select, button, a, label")) return;
+
+    closeEditor();
+    closeCreateEditor();
+
+    const columnEl = ev.currentTarget as HTMLElement;
+    const startMinutes = resolveSnappedMinutesFromClientY(ev.clientY, columnEl);
+
+    creatingBySelection = true;
+    createSelectionDayIndex = dayIndex;
+    createSelectionStartMinutes = startMinutes;
+    createSelectionColumnEl = columnEl;
+    createSelectionStartClientY = ev.clientY;
+    createSelectionHasDragged = false;
+    createSelectionPreview = buildCreateSelectionPreview(dayIndex, startMinutes, startMinutes);
+
+    ev.preventDefault();
+  }
+
+  function onWindowMouseMove(ev: MouseEvent) {
+    if (!creatingBySelection || !createSelectionColumnEl || createSelectionDayIndex < 0) return;
+
+    const currentMinutes = resolveSnappedMinutesFromClientY(ev.clientY, createSelectionColumnEl);
+    createSelectionPreview = buildCreateSelectionPreview(
+      createSelectionDayIndex,
+      createSelectionStartMinutes,
+      currentMinutes
+    );
+
+    if (Math.abs(ev.clientY - createSelectionStartClientY) > 4) {
+      createSelectionHasDragged = true;
+    }
+  }
+
+  function onWindowMouseUp() {
+    if (!creatingBySelection) return;
+
+    const selection = createSelectionPreview;
+    const columnEl = createSelectionColumnEl;
+    const shouldOpenEditor = !!selection && !!columnEl && createSelectionHasDragged;
+
+    clearCreateSelectionState();
+
+    if (!shouldOpenEditor || !selection || !columnEl) return;
+    openCreateEditorFromSelection(
+      selection.dayIndex,
+      selection.startMinutes,
+      selection.endMinutes,
+      columnEl
+    );
+  }
+
   function positionEditorNearEvent(eventEl: HTMLElement) {
     if (!calendarPanelEl) return;
 
@@ -580,6 +931,9 @@
   }
 
   function selectEvent(item: RenderedAppointment | MultiDayAppointment, ev: MouseEvent) {
+    clearCreateSelectionState();
+    closeCreateEditor();
+
     const card = ev.currentTarget as HTMLElement | null;
     if (card) positionEditorNearEvent(card);
 
@@ -713,6 +1067,9 @@
       return;
     }
 
+    clearCreateSelectionState();
+    closeCreateEditor();
+
     if (selectedEventId === item.id) closeEditor();
 
     draggingId = item.id;
@@ -725,7 +1082,8 @@
       recurrence: item.recurrence,
       recurrenceUntilIso: item.recurrenceUntilIso,
       seriesId: item.seriesId,
-      durationMs: item.fullDurationMs
+      durationMs: item.fullDurationMs,
+      isMultiDay: isMultiDaySpan(item.startIso, item.endIso)
     };
     const card = ev.currentTarget as HTMLElement;
     const rect = card.getBoundingClientRect();
@@ -741,6 +1099,7 @@
     draggingId = "";
     dragOffsetY = 0;
     dropPreview = null;
+    multiDayDropPreview = null;
     dragMeta = null;
     clearEdgeSwitchState();
   }
@@ -769,82 +1128,16 @@
     };
   }
 
-  function onGridDragOver(dayIndex: number, ev: DragEvent) {
-    if (!draggingId) return;
-    ev.preventDefault();
-    maybeSwitchWeekByEdge(ev.clientX);
+  function resolveDayIndexFromClientX(clientX: number, zoneEl: HTMLElement) {
+    const rect = zoneEl.getBoundingClientRect();
+    if (rect.width <= 0) return null;
 
-    const item =
-      dragMeta && dragMeta.id === draggingId
-        ? dragMeta
-        : (() => {
-            const base = renderedById.get(draggingId);
-            if (!base?.id) return null;
-            return {
-              id: base.id,
-              title: base.title,
-              color: base.color,
-              startIso: base.start,
-              endIso: base.end,
-              recurrence: base.recurrence ?? "none",
-              recurrenceUntilIso: base.recurrenceUntil ?? null,
-              seriesId: base.seriesId ?? null,
-              durationMs: Math.max(15 * 60_000, new Date(base.end).getTime() - new Date(base.start).getTime())
-            } satisfies DragMeta;
-          })();
-    if (!item) return;
-
-    const columnEl = ev.currentTarget as HTMLElement;
-    const position = resolveDropPosition(dayIndex, ev.clientY, columnEl, item);
-    dropPreview = {
-      dayIndex,
-      top: position.top,
-      height: position.height,
-      color: item.color
-    };
-
-    if (ev.dataTransfer) ev.dataTransfer.dropEffect = "move";
+    const relativeX = clamp(clientX - rect.left, 0, rect.width - 1);
+    const dayWidth = rect.width / 7;
+    return clamp(Math.floor(relativeX / dayWidth), 0, 6);
   }
 
-  async function onGridDrop(dayIndex: number, ev: DragEvent) {
-    ev.preventDefault();
-    clearEdgeSwitchState();
-
-    const id = draggingId;
-    if (!id) return;
-
-    const item =
-      dragMeta && dragMeta.id === id
-        ? dragMeta
-        : (() => {
-            const base = renderedById.get(id);
-            if (!base?.id) return null;
-            return {
-              id: base.id,
-              title: base.title,
-              color: base.color,
-              startIso: base.start,
-              endIso: base.end,
-              recurrence: base.recurrence ?? "none",
-              recurrenceUntilIso: base.recurrenceUntil ?? null,
-              seriesId: base.seriesId ?? null,
-              durationMs: Math.max(15 * 60_000, new Date(base.end).getTime() - new Date(base.start).getTime())
-            } satisfies DragMeta;
-          })();
-    if (!item) {
-      endDrag();
-      return;
-    }
-
-    const columnEl = ev.currentTarget as HTMLElement;
-    const position = resolveDropPosition(dayIndex, ev.clientY, columnEl, item);
-
-    const nextStart = new Date(weekDays[dayIndex]);
-    nextStart.setHours(0, 0, 0, 0);
-    nextStart.setMinutes(position.startMinutes);
-
-    const nextEnd = new Date(nextStart.getTime() + item.durationMs);
-
+  async function persistDraggedMove(id: string, item: DragMeta, nextStart: Date, nextEnd: Date) {
     const previousStart = new Date(item.startIso).getTime();
     const previousEnd = new Date(item.endIso).getTime();
     const nextStartMs = nextStart.getTime();
@@ -886,6 +1179,149 @@
     }
   }
 
+  function onMultiDayStripDragOver(ev: DragEvent) {
+    if (!draggingId) return;
+    ev.preventDefault();
+    maybeSwitchWeekByEdge(ev.clientX);
+
+    const item = resolveActiveDragMeta(draggingId);
+    if (!item) return;
+
+    // A faixa superior só aceita preview de evento multi-dia.
+    dropPreview = null;
+    if (!item.isMultiDay) {
+      multiDayDropPreview = null;
+      return;
+    }
+
+    const zoneEl = ev.currentTarget as HTMLElement;
+    const dayIndex = resolveDayIndexFromClientX(ev.clientX, zoneEl);
+    if (dayIndex === null) {
+      multiDayDropPreview = null;
+      return;
+    }
+
+    const placement = resolveMultiDayPlacement(item, dayIndex);
+    if (!placement) {
+      multiDayDropPreview = null;
+      return;
+    }
+
+    multiDayDropPreview = {
+      startDayIndex: placement.startDayIndex,
+      endDayIndex: placement.endDayIndex,
+      row: placement.row,
+      color: item.color,
+      title: item.title
+    };
+
+    if (ev.dataTransfer) ev.dataTransfer.dropEffect = "move";
+  }
+
+  async function onMultiDayStripDrop(ev: DragEvent) {
+    ev.preventDefault();
+    clearEdgeSwitchState();
+
+    const id = draggingId;
+    if (!id) return;
+
+    const item = resolveActiveDragMeta(id);
+    if (!item || !item.isMultiDay) {
+      endDrag();
+      return;
+    }
+
+    const zoneEl = ev.currentTarget as HTMLElement;
+    const dayIndex = resolveDayIndexFromClientX(ev.clientX, zoneEl);
+    if (dayIndex === null) {
+      endDrag();
+      return;
+    }
+
+    const placement = resolveMultiDayPlacement(item, dayIndex);
+    if (!placement) {
+      endDrag();
+      return;
+    }
+
+    await persistDraggedMove(id, item, placement.nextStart, placement.nextEnd);
+  }
+
+  function onGridDragOver(dayIndex: number, ev: DragEvent) {
+    if (!draggingId) return;
+    ev.preventDefault();
+    maybeSwitchWeekByEdge(ev.clientX);
+
+    const item = resolveActiveDragMeta(draggingId);
+    if (!item) return;
+
+    if (item.isMultiDay) {
+      const placement = resolveMultiDayPlacement(item, dayIndex);
+      if (!placement) {
+        multiDayDropPreview = null;
+        return;
+      }
+
+      multiDayDropPreview = {
+        startDayIndex: placement.startDayIndex,
+        endDayIndex: placement.endDayIndex,
+        row: placement.row,
+        color: item.color,
+        title: item.title
+      };
+      dropPreview = null;
+    } else {
+      const columnEl = ev.currentTarget as HTMLElement;
+      const position = resolveDropPosition(dayIndex, ev.clientY, columnEl, item);
+      dropPreview = {
+        dayIndex,
+        top: position.top,
+        height: position.height,
+        color: item.color
+      };
+      multiDayDropPreview = null;
+    }
+
+    if (ev.dataTransfer) ev.dataTransfer.dropEffect = "move";
+  }
+
+  async function onGridDrop(dayIndex: number, ev: DragEvent) {
+    ev.preventDefault();
+    clearEdgeSwitchState();
+
+    const id = draggingId;
+    if (!id) return;
+
+    const item = resolveActiveDragMeta(id);
+    if (!item) {
+      endDrag();
+      return;
+    }
+
+    let nextStart: Date;
+    let nextEnd: Date;
+
+    if (item.isMultiDay) {
+      const placement = resolveMultiDayPlacement(item, dayIndex);
+      if (!placement) {
+        endDrag();
+        return;
+      }
+      nextStart = placement.nextStart;
+      nextEnd = placement.nextEnd;
+    } else {
+      const columnEl = ev.currentTarget as HTMLElement;
+      const position = resolveDropPosition(dayIndex, ev.clientY, columnEl, item);
+
+      nextStart = new Date(weekDays[dayIndex]);
+      nextStart.setHours(0, 0, 0, 0);
+      nextStart.setMinutes(position.startMinutes);
+      nextEnd = new Date(nextStart.getTime() + item.durationMs);
+    }
+
+    await persistDraggedMove(id, item, nextStart, nextEnd);
+  }
+
   onMount(async () => {
     setCreateDefaults();
     await load();
@@ -894,1250 +1330,572 @@
   });
 </script>
 
-<div class="app-shell">
+<svelte:window on:mousemove={onWindowMouseMove} on:mouseup={onWindowMouseUp} />
+
+<div class="app-shell" data-theme="corporate">
+  <div class="app-stage min-h-screen bg-base-200">
   {#if toast}
-    <div class="toast">{toast}</div>
+    <div class="toast toast-top toast-end z-50">
+      <div class="alert alert-info shadow">
+        <span>{toast}</span>
+      </div>
+    </div>
   {/if}
 
-  <header class="topbar">
-    <div class="topbar-left">
-      <button
-        class="icon-btn"
-        type="button"
-        aria-label="Menu"
-        aria-expanded={sidebarOpen}
-        on:click={() => (sidebarOpen = !sidebarOpen)}
-      >
-        ☰
-      </button>
-      <div class="brand-icon">31</div>
-      <div class="brand-title">Agenda</div>
-    </div>
+  <!-- Drawer (Sidebar) -->
+  <div class={`agenda-drawer drawer ${sidebarOpen ? "drawer-open lg:drawer-open" : ""}`}>
+    <input id="agenda-drawer" type="checkbox" class="drawer-toggle" bind:checked={sidebarOpen} />
 
-    <div class="topbar-center">
-      <button class="today-btn" type="button" on:click={() => void goToday()}>Hoje</button>
-      <button class="icon-btn" type="button" aria-label="Semana anterior" on:click={() => void shiftWeek(-7)}>‹</button>
-      <button class="icon-btn" type="button" aria-label="Proxima semana" on:click={() => void shiftWeek(7)}>›</button>
-      <h1 class="month-title">{monthTitle}</h1>
-    </div>
-  </header>
-
-  <div class="workspace" class:is-collapsed={!sidebarOpen}>
-    <aside class="sidebar" class:is-hidden={!sidebarOpen}>
-      <button class="create-pill" type="button" on:click={() => (createOpen = !createOpen)}>
-        <span class="create-plus">+</span>
-        <span>Criar</span>
-        <span class="create-caret">▾</span>
-      </button>
-
-      {#if createOpen}
-        <form class="create-form" on:submit|preventDefault={() => void submit()}>
-          <label>
-            <span>Titulo</span>
-            <input bind:value={title} placeholder="Ex: Reuniao de status" required />
+    <!-- Conteúdo -->
+    <div class="drawer-content agenda-content flex flex-col">
+      <!-- Topbar -->
+      <header class="navbar agenda-topbar bg-base-100 border-b border-base-300 sticky top-0 z-40">
+        <div class="navbar-start gap-1 sm:gap-2">
+          <label for="agenda-drawer" class="menu-toggle-btn btn btn-ghost btn-circle" aria-label="Menu">
+        <svg viewBox="0 0 24 24" fill="none" aria-hidden="true">
+          <path d="M4 7h16M4 12h16M4 17h16" stroke="currentColor" stroke-width="1.9" stroke-linecap="round"></path>
+        </svg>
           </label>
 
-          <label>
-            <span>Inicio</span>
-            <input type="datetime-local" bind:value={startLocal} required />
-          </label>
+          <div class="brand-lockup flex items-center gap-2">
+        <div class="gcal-mark" aria-hidden="true">
+          <span class="gcal-tab"></span>
+          <span class="gcal-day">{new Date().getDate()}</span>
+        </div>
+        <span class="brand-title text-lg font-semibold tracking-tight">Agenda</span>
+          </div>
+        </div>
 
-          <label>
-            <span>Fim</span>
-            <input type="datetime-local" bind:value={endLocal} required />
-          </label>
+        <div class="navbar-center flex-1 hidden md:flex justify-center"></div>
 
-          <label>
-            <span>Cor</span>
-            <input type="color" bind:value={color} />
-          </label>
+        <div class="navbar-end gap-2 lg:gap-3">
+          <button class="btn btn-sm today-btn hidden md:inline-flex" type="button" on:click={() => void goToday()}>Hoje</button>
 
-          <label>
-            <span>Repeticao</span>
-            <select bind:value={recurrence}>
-              {#each RECURRENCE_OPTIONS as option}
-                <option value={option.value}>{option.label}</option>
-              {/each}
-            </select>
-          </label>
+          <div class="week-nav hidden md:flex">
+        <button class="btn btn-sm btn-ghost week-nav-btn" type="button" aria-label="Semana anterior" on:click={() => void shiftWeek(-7)}>
+          ‹
+        </button>
+        <button class="btn btn-sm btn-ghost week-nav-btn" type="button" aria-label="Próxima semana" on:click={() => void shiftWeek(7)}>
+          ›
+        </button>
+          </div>
 
-          {#if recurrence !== "none"}
-            <label>
-              <span>Repetir ate</span>
-              <input type="date" bind:value={recurrenceUntilLocal} required={true} />
-              <!--<input type="date" bind:value={recurrenceUntilLocal} required={recurrence !== "none"} /> -->
+          <h1 class="month-label text-base font-semibold text-base-content/80 hidden md:block">{monthTitle}</h1>
 
-            </label>
+          <button class="btn btn-sm today-btn md:hidden" type="button" on:click={() => void goToday()}>Hoje</button>
+        </div>
+      </header>
+
+      <div class="calendar-stage p-3 sm:p-4">
+        <div
+          class="card calendar-frame bg-base-100 shadow-sm border border-base-300 overflow-hidden"
+          class:slide-next={weekSlideDirection === "next"}
+          class:slide-prev={weekSlideDirection === "prev"}
+          role="group"
+          aria-label="Calendário semanal"
+          bind:this={calendarPanelEl}
+          on:dragover={onPanelDragOver}
+        >
+          <!-- Erro -->
+          {#if error}
+            <div class="p-3">
+              <div class="alert alert-error">
+                <span>{error}</span>
+              </div>
+            </div>
           {/if}
 
-          <button class="save-btn" type="submit" disabled={loading}>Salvar compromisso</button>
-        </form>
-      {/if}
+          <!-- Edge hints -->
+          <div
+            class="pointer-events-none absolute inset-y-0 left-0 w-2 bg-primary/20 opacity-0 transition-opacity"
+            class:opacity-100={edgeHint === "left" && !!draggingId}
+          ></div>
+          <div
+            class="pointer-events-none absolute inset-y-0 right-0 w-2 bg-primary/20 opacity-0 transition-opacity"
+            class:opacity-100={edgeHint === "right" && !!draggingId}
+          ></div>
 
-      <section class="mini-calendar">
-        <div class="mini-header">
-          <button class="mini-nav" type="button" aria-label="Mes anterior" on:click={() => shiftMiniMonth(-1)}>‹</button>
-          <strong>{miniMonthTitle}</strong>
-          <button class="mini-nav" type="button" aria-label="Proximo mes" on:click={() => shiftMiniMonth(1)}>›</button>
-        </div>
+          <!-- Cabeçalho dias -->
+          <div class="week-header grid grid-cols-[72px_repeat(7,minmax(0,1fr))] border-b border-base-300 bg-base-100 sticky top-0 z-20">
+            <div class="week-timezone flex items-center justify-center text-xs font-medium text-base-content/60 py-2">
+              GMT-03
+            </div>
 
-        <div class="mini-grid">
-          {#each MINI_WEEKDAY_HEADER as dayName}
-            <div class="mini-weekday">{dayName}</div>
+            {#each weekDays as day (day.getTime())}
+            <div class="week-day-head flex flex-col items-center justify-center py-2 gap-0.5" class:today-col={sameDay(day, new Date())}>
+              <span class="week-day-label text-xs text-base-content/60">
+                {WEEKDAY_HEADER[day.getDay()]} </span>
+              <strong class="week-day-number text-sm">{day.getDate()}</strong>
+            </div>
           {/each}
-
-          {#each miniDays as day}
-            <button
-              class="mini-day {day.inMonth ? '' : 'is-outside'} {day.isToday ? 'is-today' : ''} {day.inCurrentWeek ? 'is-week' : ''}"
-              type="button"
-              on:click={() => void pickMiniDay(day)}
-            >
-              {day.date.getDate()}
-            </button>
-          {/each}
-        </div>
-      </section>
-    </aside>
-
-    <div
-      class="calendar-panel"
-      role="group"
-      aria-label="Calendario semanal"
-      class:slide-next={weekSlideDirection === "next"}
-      class:slide-prev={weekSlideDirection === "prev"}
-      bind:this={calendarPanelEl}
-      on:dragover={onPanelDragOver}
-    >
-      {#if error}
-        <div class="error-banner">{error}</div>
-      {/if}
-
-      <div class="edge-switch edge-left" class:is-visible={edgeHint === "left" && !!draggingId}></div>
-      <div class="edge-switch edge-right" class:is-visible={edgeHint === "right" && !!draggingId}></div>
-
-      <div class="calendar-head">
-        <div class="timezone-head">GMT-03</div>
-        {#each weekDays as day, dayIndex (day.toISOString())}
-          <div class="day-head {sameDay(day, new Date()) ? 'is-today' : ''}">
-            <span>{WEEKDAY_HEADER[dayIndex]}</span>
-            <strong>{day.getDate()}</strong>
           </div>
-        {/each}
-      </div>
 
-      {#if multiDayItems.length > 0}
-        <div class="multiday-strip" style={`height: ${Math.max(38, multiDayRows * 30 + 8)}px;`}>
-          <div class="multiday-timepad">Multi-dia</div>
-          <div class="multiday-grid">
-            {#each multiDayItems as item (`multi-${item.id}-${item.startDayIndex}-${item.endDayIndex}-${item.row}`)}
-              <button
-                type="button"
-                class="multiday-card {draggingId === item.id ? 'is-dragging' : ''} {isSaving(item.id) ? 'is-saving' : ''} {selectedEventId === item.id ? 'is-selected' : ''}"
-                style={`grid-column: ${item.startDayIndex + 1} / ${item.endDayIndex + 2}; grid-row: ${item.row + 1}; background: ${hexToRgba(item.color, 0.2)}; border-left-color: ${item.color};`}
-                aria-label={`Editar compromisso multi-dia ${item.title}`}
-                draggable={!isLocked(item.id) && item.canDrag}
-                on:click|stopPropagation={(ev) => selectEvent(item, ev)}
-                on:dragstart={(ev) => beginDrag(item, ev)}
-                on:dragend={endDrag}
-              >
-                <div class="multiday-title">{item.title}</div>
-                <div class="multiday-time">{formatRange(item.startIso, item.endIso)}</div>
-              </button>
-            {/each}
-          </div>
-        </div>
-      {/if}
-
-      <div class="calendar-body" bind:this={gridScrollEl}>
-        <div class="hours-column">
-          {#each HOUR_ROWS as hour}
-            <div class="hour-slot">{hour > 0 ? `${pad2(hour)}:00` : ""}</div>
-          {/each}
-        </div>
-
-        <div class="days-scroll">
-          <div class="days-canvas" style={`height: ${DAY_HEIGHT}px;`}>
-            <div class="hour-lines"></div>
-
-            <div class="day-columns">
-              {#each weekDays as day, dayIndex (day.toISOString())}
+          <!-- Multi-dia -->
+          {#if multiDayItems.length > 0 || multiDayDropPreview}
+            <div class="border-b border-base-300 bg-base-100" style={`height: ${multiDayStripHeight}px;`}>
+              <div class="grid grid-cols-[72px_1fr]">
+                <div class="p-2"></div>
                 <div
-                  class="day-column"
-                  role="gridcell"
-                  tabindex="-1"
-                  aria-label={`Coluna ${WEEKDAY_HEADER[dayIndex]} ${day.getDate()}`}
-                  on:mousedown={closeEditor}
-                  on:dragover={(ev) => onGridDragOver(dayIndex, ev)}
-                  on:drop={(ev) => void onGridDrop(dayIndex, ev)}
+                  class="p-2"
+                  role="region"
+                  aria-label="Faixa de eventos multi-dia"
+                  on:dragover={onMultiDayStripDragOver}
+                  on:drop={(ev) => void onMultiDayStripDrop(ev)}
                 >
-                  {#if dropPreview && dropPreview.dayIndex === dayIndex}
-                    <div
-                      class="drop-preview"
-                      style={`top: ${dropPreview.top}px; height: ${dropPreview.height}px; background: ${hexToRgba(dropPreview.color, 0.2)}; border-color: ${dropPreview.color};`}
-                    ></div>
-                  {/if}
+                  <div class="grid grid-cols-7 gap-2">
+                    {#each multiDayItems as item (`multi-${item.id}-${item.startDayIndex}-${item.endDayIndex}-${item.row}`)}
+                      <button
+                        type="button"
+                        class="event-pill multi-pill w-full text-left rounded-md border border-base-300 shadow-sm px-2 py-1 overflow-hidden transition
+                               hover:shadow-md hover:border-base-400"
+                        class:opacity-70={draggingId === item.id}
+                        class:animate-pulse={isSaving(item.id)}
+                        class:ring-2={selectedEventId === item.id}
+                        class:ring-primary={selectedEventId === item.id}
+                        style={`grid-column: ${item.startDayIndex + 1} / ${item.endDayIndex + 2}; grid-row: ${item.row + 1};
+                                background: ${hexToRgba(item.color, 0.2)}; border-left: 4px solid ${item.color};`}
+                        aria-label={`Editar compromisso multi-dia ${item.title}`}
+                        draggable={!isLocked(item.id) && item.canDrag}
+                        on:click|stopPropagation={(ev) => selectEvent(item, ev)}
+                        on:dragstart={(ev) => beginDrag(item, ev)}
+                        on:dragend={endDrag}
+                      >
+                        <div class="text-sm font-semibold truncate">{item.title}</div>
+                        <div class="text-xs text-base-content/70">{formatRange(item.startIso, item.endIso)}</div>
+                      </button>
+                    {/each}
 
-                  {#each itemsByDay[dayIndex] ?? [] as item (item.segmentKey)}
-                    <button
-                      class="event-card {draggingId === item.id ? 'is-dragging' : ''} {isSaving(item.id) ? 'is-saving' : ''} {selectedEventId === item.id ? 'is-selected' : ''}"
-                      type="button"
-                      aria-label={`Editar compromisso ${item.title}`}
-                      draggable={!isLocked(item.id) && item.canDrag}
-                      on:click|stopPropagation={(ev) => selectEvent(item, ev)}
-                      on:dragstart={(ev) => beginDrag(item, ev)}
-                      on:dragend={endDrag}
-                      style={`top: ${item.top}px; background: ${hexToRgba(item.color, 0.2)}; border-left-color: ${item.color};`}
-                    >
-                      <div class="event-main">
-                        <div class="event-title">{item.title}</div>
-                        <div class="event-time">{formatRange(item.startIso, item.endIso)}</div>
+                    {#if multiDayDropPreview}
+                      <div
+                        class="event-pill multi-pill multi-day-drop-preview pointer-events-none w-full overflow-hidden px-2 py-1 text-left"
+                        style={`grid-column: ${multiDayDropPreview.startDayIndex + 1} / ${multiDayDropPreview.endDayIndex + 2}; grid-row: ${multiDayDropPreview.row + 1};
+                                background: ${hexToRgba(multiDayDropPreview.color, 0.22)}; border-left: 4px solid ${multiDayDropPreview.color};`}
+                      >
+                        <div class="text-sm font-semibold truncate">{multiDayDropPreview.title}</div>
                       </div>
-                    </button>
-                  {/each}
+                    {/if}
+                  </div>
+                </div>
+              </div>
+            </div>
+          {/if}
+
+          <!-- Corpo -->
+          <div class="grid grid-cols-[72px_1fr]">
+            <!-- Coluna horas -->
+            <div class="hour-axis border-r border-base-300 bg-base-100">
+              {#each HOUR_ROWS as hour}
+                <div class="hour-slot h-12 flex items-start justify-end pr-2 pt-1 text-xs text-base-content/50">
+                  {hour > 0 ? `${pad2(hour)}:00` : ""}
                 </div>
               {/each}
             </div>
+
+            <!-- Grade dias -->
+            <div class="week-grid-scroll relative overflow-auto" bind:this={gridScrollEl}>
+              <div class="relative" style={`height: ${DAY_HEIGHT}px;`}>
+                <!-- linhas de hora (repeating gradient) -->
+                <div
+                  class="absolute inset-0 pointer-events-none
+                         bg-[repeating-linear-gradient(to_bottom,hsl(var(--bc)/0.06)_0,hsl(var(--bc)/0.06)_1px,transparent_1px,transparent_48px)]"
+                ></div>
+
+                <div class="grid grid-cols-7 h-full">
+                  {#each weekDays as day, dayIndex (day.toISOString())}
+                    <div
+                      class="week-day-column relative h-full border-l border-base-300"
+                      class:today-grid-col={sameDay(day, new Date())}
+                      role="gridcell"
+                      tabindex="-1"
+                      aria-label={`Coluna ${WEEKDAY_HEADER[dayIndex]} ${day.getDate()}`}
+                      on:mousedown={(ev) => onDayColumnMouseDown(dayIndex, ev)}
+                      on:dragover={(ev) => onGridDragOver(dayIndex, ev)}
+                      on:drop={(ev) => void onGridDrop(dayIndex, ev)}
+                    >
+                      {#if dropPreview && dropPreview.dayIndex === dayIndex}
+                        <div
+                          class="drop-preview absolute left-1 right-1 rounded-lg border border-base-300 shadow-sm"
+                          style={`top: ${dropPreview.top}px; height: ${dropPreview.height}px;
+                                  background: ${hexToRgba(dropPreview.color, 0.2)}; border-color: ${dropPreview.color};`}
+                        ></div>
+                      {/if}
+
+                      {#if createSelectionPreview && createSelectionPreview.dayIndex === dayIndex}
+                        <div
+                          class="create-selection-preview absolute left-1 right-1 rounded-lg"
+                          style={`top: ${createSelectionPreview.top}px; height: ${createSelectionPreview.height}px;`}
+                        ></div>
+                      {/if}
+
+                      {#each itemsByDay[dayIndex] ?? [] as item (item.segmentKey)}
+                        <button
+                          type="button"
+                          class="event-pill day-pill absolute left-1 right-1 rounded-lg border border-base-300 shadow-sm px-2 py-1 text-left
+                                 transition hover:shadow-md hover:border-base-400
+                                 focus:outline-none focus:ring-2 focus:ring-primary"
+                          class:opacity-70={draggingId === item.id}
+                          class:animate-pulse={isSaving(item.id)}
+                          class:ring-2={selectedEventId === item.id}
+                          class:ring-primary={selectedEventId === item.id}
+                          aria-label={`Editar compromisso ${item.title}`}
+                          draggable={!isLocked(item.id) && item.canDrag}
+                          on:click|stopPropagation={(ev) => selectEvent(item, ev)}
+                          on:dragstart={(ev) => beginDrag(item, ev)}
+                          on:dragend={endDrag}
+                          style={`top: ${item.top}px; background: ${hexToRgba(item.color, 0.2)}; border-left: 4px solid ${item.color};`}
+                        >
+                          <div class="flex flex-col gap-0.5">
+                            <div class="text-sm font-semibold truncate">{item.title}</div>
+                            <div class="text-xs text-base-content/70">{formatRange(item.startIso, item.endIso)}</div>
+                          </div>
+                        </button>
+                      {/each}
+                    </div>
+                  {/each}
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <!-- Editor flutuante -->
+          {#if createEditorOpen}
+            <section
+              class="card event-editor w-96 bg-base-100 shadow-xl border border-base-300 absolute z-30"
+              aria-label="Criar compromisso"
+              style={`top: ${createEditorTop}px; left: ${createEditorLeft}px;`}
+            >
+              <div class="card-body p-4 gap-3">
+                <div class="flex items-center justify-between">
+                  <strong class="text-sm">Novo compromisso</strong>
+                  <button
+                    class="btn btn-ghost btn-sm btn-circle"
+                    type="button"
+                    aria-label="Fechar criação"
+                    on:click={closeCreateEditor}
+                  >
+                    ✕
+                  </button>
+                </div>
+
+                {#if createDraftError}
+                  <div class="alert alert-error">
+                    <span>{createDraftError}</span>
+                  </div>
+                {/if}
+
+                <label class="form-control">
+                  <div class="label"><span class="label-text">Título</span></div>
+                  <input class="input input-bordered input-sm" type="text" bind:value={createDraftTitle} disabled={savingCreate} />
+                </label>
+
+                <div class="grid grid-cols-2 gap-2">
+                  <label class="form-control">
+                    <div class="label"><span class="label-text">Início</span></div>
+                    <input
+                      class="input input-bordered input-sm"
+                      type="datetime-local"
+                      bind:value={createDraftStartLocal}
+                      disabled={savingCreate}
+                    />
+                  </label>
+                  <label class="form-control">
+                    <div class="label"><span class="label-text">Fim</span></div>
+                    <input
+                      class="input input-bordered input-sm"
+                      type="datetime-local"
+                      bind:value={createDraftEndLocal}
+                      disabled={savingCreate}
+                    />
+                  </label>
+                </div>
+
+                <div class="grid grid-cols-2 gap-2">
+                  <label class="form-control">
+                    <div class="label"><span class="label-text">Repetição</span></div>
+                    <select class="select select-bordered select-sm" bind:value={createDraftRecurrence} disabled={savingCreate}>
+                      {#each RECURRENCE_OPTIONS as option}
+                        <option value={option.value}>{option.label}</option>
+                      {/each}
+                    </select>
+                  </label>
+
+                  {#if createDraftRecurrence !== "none"}
+                    <label class="form-control">
+                      <div class="label"><span class="label-text">Repetir até</span></div>
+                      <input
+                        class="input input-bordered input-sm"
+                        type="date"
+                        bind:value={createDraftRecurrenceUntilLocal}
+                        disabled={savingCreate}
+                      />
+                    </label>
+                  {/if}
+                </div>
+
+                <div class="flex items-center gap-2 justify-between">
+                  <label class="flex items-center gap-2">
+                    <span class="text-xs text-base-content/70">Cor</span>
+                    <input
+                      class="h-8 w-10 rounded-md border border-base-300 bg-base-100"
+                      type="color"
+                      bind:value={createDraftColor}
+                      disabled={savingCreate}
+                    />
+                  </label>
+
+                  <div class="flex gap-2">
+                    <button class="btn btn-ghost btn-sm" type="button" disabled={savingCreate} on:click={closeCreateEditor}>
+                      Cancelar
+                    </button>
+                    <button
+                      class="btn btn-primary btn-sm"
+                      type="button"
+                      disabled={savingCreate}
+                      on:click={() => void saveCreateFromEditor()}
+                    >
+                      {savingCreate ? "Salvando..." : "Salvar"}
+                    </button>
+                  </div>
+                </div>
+              </div>
+            </section>
+          {/if}
+
+          <!-- Editor flutuante -->
+          {#if selectedItem}
+            <section
+              class="card event-editor w-96 bg-base-100 shadow-xl border border-base-300 absolute z-30"
+              aria-label="Editar compromisso"
+              style={`top: ${editorTop}px; left: ${editorLeft}px;`}
+            >
+              <div class="card-body p-4 gap-3">
+                <div class="flex items-center justify-between">
+                  <strong class="text-sm">Editar compromisso</strong>
+                  <button class="btn btn-ghost btn-sm btn-circle" type="button" aria-label="Fechar editor" on:click={closeEditor}>
+                    ✕
+                  </button>
+                </div>
+
+                {#if editError}
+                  <div class="alert alert-error">
+                    <span>{editError}</span>
+                  </div>
+                {/if}
+
+                <label class="form-control">
+                  <div class="label"><span class="label-text">Título</span></div>
+                  <input class="input input-bordered input-sm" type="text" bind:value={editTitle} disabled={isLocked(selectedEventId)} />
+                </label>
+
+                <div class="grid grid-cols-2 gap-2">
+                  <label class="form-control">
+                    <div class="label"><span class="label-text">Início</span></div>
+                    <input class="input input-bordered input-sm" type="datetime-local" bind:value={editStartLocal} disabled={isLocked(selectedEventId)} />
+                  </label>
+                  <label class="form-control">
+                    <div class="label"><span class="label-text">Fim</span></div>
+                    <input class="input input-bordered input-sm" type="datetime-local" bind:value={editEndLocal} disabled={isLocked(selectedEventId)} />
+                  </label>
+                </div>
+
+                <div class="grid grid-cols-2 gap-2">
+                  <label class="form-control">
+                    <div class="label"><span class="label-text">Repetição</span></div>
+                    <select class="select select-bordered select-sm" bind:value={editRecurrence} disabled={isLocked(selectedEventId)}>
+                      {#each RECURRENCE_OPTIONS as option}
+                        <option value={option.value}>{option.label}</option>
+                      {/each}
+                    </select>
+                  </label>
+
+                  {#if editRecurrence !== "none"}
+                    <label class="form-control">
+                      <div class="label"><span class="label-text">Repetir até</span></div>
+                      <input class="input input-bordered input-sm" type="date" bind:value={editRecurrenceUntilLocal} disabled={isLocked(selectedEventId)} />
+                    </label>
+                  {/if}
+                </div>
+
+                <div class="flex items-center gap-2 justify-between">
+                  <label class="flex items-center gap-2">
+                    <span class="text-xs text-base-content/70">Cor</span>
+                    <input class="h-8 w-10 rounded-md border border-base-300 bg-base-100" type="color" bind:value={editColor} disabled={isLocked(selectedEventId)} />
+                  </label>
+
+                  <div class="flex gap-2">
+                    <button class="btn btn-error btn-sm" type="button" disabled={isLocked(selectedEventId)} on:click={() => void removeSelected()}>
+                      Excluir
+                    </button>
+                    <button class="btn btn-primary btn-sm" type="button" disabled={isLocked(selectedEventId)} on:click={() => void saveSelectedEdit()}>
+                      Salvar
+                    </button>
+                  </div>
+                </div>
+              </div>
+            </section>
+          {/if}
+
+          <!-- Modal excluir recorrente -->
+          {#if deleteModalOpen && selectedItem}
+            <div class="modal modal-open">
+              <div class="modal-box">
+                <h3 class="font-bold text-lg">Excluir evento recorrente</h3>
+                <p class="py-2 text-base-content/80">Escolha como deseja excluir "{selectedItem.title}".</p>
+
+                <div class="space-y-2">
+                  <label class="flex items-center gap-2 cursor-pointer">
+                    <input class="radio radio-primary" type="radio" bind:group={deleteScope} value="single" />
+                    <span>Este evento</span>
+                  </label>
+
+                  <label class="flex items-center gap-2 cursor-pointer">
+                    <input class="radio radio-primary" type="radio" bind:group={deleteScope} value="following" />
+                    <span>Este e os seguintes</span>
+                  </label>
+
+                  <label class="flex items-center gap-2 cursor-pointer">
+                    <input class="radio radio-primary" type="radio" bind:group={deleteScope} value="all" />
+                    <span>Todos os eventos</span>
+                  </label>
+                </div>
+
+                <div class="modal-action">
+                  <button class="btn" type="button" on:click={cancelDeleteModal}>Cancelar</button>
+                  <button
+                    class="btn btn-error"
+                    type="button"
+                    disabled={isLocked(selectedEventId)}
+                    on:click={() => void confirmRecurringDelete()}
+                  >
+                    Excluir
+                  </button>
+                </div>
+              </div>
+
+              <!-- clicar fora fecha -->
+              <form method="dialog" class="modal-backdrop">
+                <button type="button" on:click={cancelDeleteModal}>close</button>
+              </form>
+            </div>
+          {/if}
+
+          {#if !loading && renderedItems.length === 0 && multiDayItems.length === 0}
+            <div class="p-6 text-center text-base-content/60">
+              Nenhum compromisso nesta semana.
+            </div>
+          {/if}
+
+          <div class="drag-tip p-3 text-xs text-base-content/60 border-t border-base-300 bg-base-100">
+            Clique em um compromisso para editar título, horário, cor ou excluir. Arraste e solte para mover e salvar.
           </div>
         </div>
       </div>
+    </div>
 
-      {#if selectedItem}
-        <section class="event-editor" aria-label="Editar compromisso" style={`top: ${editorTop}px; left: ${editorLeft}px;`}>
-          <div class="event-editor-head">
-            <strong>Editar compromisso</strong>
-            <button class="editor-close" type="button" aria-label="Fechar editor" on:click={closeEditor}>✕</button>
-          </div>
+    <!-- Sidebar -->
+    <div class="drawer-side z-50">
+      <label for="agenda-drawer" class="drawer-overlay"></label>
 
-          {#if editError}
-            <div class="editor-error">{editError}</div>
+      <aside class="agenda-sidebar w-80 min-h-full bg-base-100 border-r border-base-300 p-4 space-y-4">
+        <!-- Criar -->
+        <div class="create-panel border border-base-300">
+          <button
+            class="create-pill-btn"
+            type="button"
+            aria-expanded={createOpen}
+            aria-controls="create-form-panel"
+            on:click={() => (createOpen = !createOpen)}
+          >
+            <span class="create-plus-mark" aria-hidden="true">+</span>
+            <span class="create-pill-label">Criar</span>
+            <span class="create-pill-caret" aria-hidden="true">▾</span>
+          </button>
+
+          {#if createOpen}
+            <div id="create-form-panel" class="create-form-wrap">
+              <form class="space-y-3" on:submit|preventDefault={() => void submit()}>
+                <label class="form-control">
+                  <div class="label"><span class="label-text">Título</span></div>
+                  <input class="input input-bordered input-sm" bind:value={title} placeholder="Ex: Reunião de status" required />
+                </label>
+
+                <label class="form-control">
+                  <div class="label"><span class="label-text">Início</span></div>
+                  <input class="input input-bordered input-sm" type="datetime-local" bind:value={startLocal} required />
+                </label>
+
+                <label class="form-control">
+                  <div class="label"><span class="label-text">Fim</span></div>
+                  <input class="input input-bordered input-sm" type="datetime-local" bind:value={endLocal} required />
+                </label>
+
+                <label class="form-control">
+                  <div class="label"><span class="label-text">Cor</span></div>
+                  <input class="h-10 w-full rounded-md border border-base-300 bg-base-100" type="color" bind:value={color} />
+                </label>
+
+                <label class="form-control">
+                  <div class="label"><span class="label-text">Repetição</span></div>
+                  <select class="select select-bordered select-sm" bind:value={recurrence}>
+                    {#each RECURRENCE_OPTIONS as option}
+                      <option value={option.value}>{option.label}</option>
+                    {/each}
+                  </select>
+                </label>
+
+                {#if recurrence !== "none"}
+                  <label class="form-control">
+                  <div class="label"><span class="label-text">Repetir até</span></div>
+                  <input class="input input-bordered input-sm" type="date" bind:value={recurrenceUntilLocal} required={true} />
+                  </label>
+                {/if}
+
+                <div class="pt-2">
+                  <button class="btn btn-primary btn-sm w-full" type="submit" disabled={loading}>
+                  Salvar compromisso
+                  </button>
+                </div>
+              </form>
+            </div>
           {/if}
+        </div>
 
-          <label>
-            <span>Titulo</span>
-            <input type="text" bind:value={editTitle} disabled={isLocked(selectedEventId)} />
-          </label>
-
-          <div class="event-editor-row">
-            <label>
-              <span>Inicio</span>
-              <input type="datetime-local" bind:value={editStartLocal} disabled={isLocked(selectedEventId)} />
-            </label>
-            <label>
-              <span>Fim</span>
-              <input type="datetime-local" bind:value={editEndLocal} disabled={isLocked(selectedEventId)} />
-            </label>
-          </div>
-
-          <div class="event-editor-row">
-            <label>
-              <span>Repeticao</span>
-              <select bind:value={editRecurrence} disabled={isLocked(selectedEventId)}>
-                {#each RECURRENCE_OPTIONS as option}
-                  <option value={option.value}>{option.label}</option>
-                {/each}
-              </select>
-            </label>
-            {#if editRecurrence !== "none"}
-              <label>
-                <span>Repetir ate</span>
-                <input type="date" bind:value={editRecurrenceUntilLocal} disabled={isLocked(selectedEventId)} />
-              </label>
-            {/if}
-          </div>
-
-          <div class="event-editor-actions">
-            <label class="event-editor-color">
-              <span>Cor</span>
-              <input class="event-color-input" type="color" bind:value={editColor} disabled={isLocked(selectedEventId)} />
-            </label>
-
-            <button
-              class="editor-delete-btn"
-              type="button"
-              disabled={isLocked(selectedEventId)}
-              on:click={() => void removeSelected()}
-            >
-              Excluir
-            </button>
-
-            <button
-              class="editor-save-btn"
-              type="button"
-              disabled={isLocked(selectedEventId)}
-              on:click={() => void saveSelectedEdit()}
-            >
-              Salvar
-            </button>
-          </div>
-        </section>
-      {/if}
-
-      {#if deleteModalOpen && selectedItem}
-        <div class="delete-modal-backdrop">
-          <div class="delete-modal" aria-label="Excluir evento recorrente">
-            <h3>Excluir evento recorrente</h3>
-            <p>Escolha como deseja excluir "{selectedItem.title}".</p>
-
-            <label class="delete-scope-option">
-              <input type="radio" bind:group={deleteScope} value="single" />
-              <span>Este evento</span>
-            </label>
-            <label class="delete-scope-option">
-              <input type="radio" bind:group={deleteScope} value="following" />
-              <span>Este e os seguintes</span>
-            </label>
-            <label class="delete-scope-option">
-              <input type="radio" bind:group={deleteScope} value="all" />
-              <span>Todos os eventos</span>
-            </label>
-
-            <div class="delete-modal-actions">
-              <button class="delete-cancel-btn" type="button" on:click={cancelDeleteModal}>Cancelar</button>
-              <button
-                class="delete-confirm-btn"
-                type="button"
-                disabled={isLocked(selectedEventId)}
-                on:click={() => void confirmRecurringDelete()}
-              >
-                Excluir
+        <!-- Mini calendário -->
+        <section class="mini-calendar-card card bg-base-100 border border-base-300 shadow-sm">
+          <div class="card-body p-4 gap-3">
+            <div class="mini-month-head flex items-center justify-between">
+              <button class="mini-month-btn" type="button" aria-label="Mês anterior" on:click={() => shiftMiniMonth(-1)}>
+                ‹
+              </button>
+              <strong class="mini-month-title text-sm">{miniMonthTitle}</strong>
+              <button class="mini-month-btn" type="button" aria-label="Próximo mês" on:click={() => shiftMiniMonth(1)}>
+                ›
               </button>
             </div>
+
+            <div class="grid grid-cols-7 gap-1 text-center">
+              {#each MINI_WEEKDAY_HEADER as dayName}
+                <div class="mini-weekday text-[11px] font-medium text-base-content/60">{dayName}</div>
+              {/each}
+
+              {#each miniDays as day}
+                <button
+                  type="button"
+                  class="mini-day-btn"
+                  class:is-today={day.isToday}
+                  class:is-week={day.inCurrentWeek && !day.isToday}
+                  class:is-outside={!day.inMonth}
+                  on:click={() => void pickMiniDay(day)}
+                >
+                  {day.date.getDate()}
+                </button>
+              {/each}
+            </div>
           </div>
-        </div>
-      {/if}
-
-      {#if !loading && renderedItems.length === 0 && multiDayItems.length === 0}
-        <div class="empty-state">Nenhum compromisso nesta semana.</div>
-      {/if}
-
-      <p class="helper-text">
-        Clique em um compromisso para editar titulo, horario, cor ou excluir. Arraste e solte para mover e salvar.
-      </p>
+        </section>
+      </aside>
     </div>
   </div>
 </div>
 
-<style>
-  :global(*) {
-    box-sizing: border-box;
-  }
-
-  :global(body) {
-    margin: 0;
-    color: #1f2937;
-    font-family: "Nunito Sans", "Segoe UI", sans-serif;
-    background:
-      radial-gradient(circle at 15% -5%, #dbeafe 0%, transparent 38%),
-      radial-gradient(circle at 84% 8%, #e0f2fe 0%, transparent 34%),
-      #f4f7fb;
-  }
-
-  .app-shell {
-    min-height: 100vh;
-    padding: 14px 18px 20px;
-  }
-
-  .toast {
-    position: fixed;
-    top: 18px;
-    right: 20px;
-    z-index: 30;
-    padding: 10px 14px;
-    border-radius: 12px;
-    font-weight: 700;
-    color: #fff;
-    background: #0f172a;
-    box-shadow: 0 18px 30px rgba(2, 8, 23, 0.26);
-    animation: slide-in 0.22s ease-out;
-  }
-
-  .topbar {
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-    gap: 12px;
-    margin-bottom: 14px;
-    padding: 8px 6px;
-  }
-
-  .topbar-left,
-  .topbar-center {
-    display: flex;
-    align-items: center;
-    gap: 10px;
-  }
-
-  .brand-icon {
-    width: 30px;
-    height: 30px;
-    border-radius: 8px;
-    display: grid;
-    place-items: center;
-    color: #fff;
-    font-size: 13px;
-    font-weight: 800;
-    background: linear-gradient(145deg, #2563eb, #3b82f6);
-  }
-
-  .brand-title {
-    font-size: 22px;
-    font-weight: 750;
-    color: #334155;
-    letter-spacing: 0.2px;
-  }
-
-  .month-title {
-    margin: 0 0 0 10px;
-    font-size: 22px;
-    color: #0f172a;
-    font-weight: 760;
-  }
-
-  .icon-btn,
-  .today-btn {
-    border: 1px solid #d6deef;
-    border-radius: 10px;
-    color: #334155;
-    background: #ffffff;
-    cursor: pointer;
-    transition: transform 0.12s ease, box-shadow 0.12s ease, background 0.12s ease;
-  }
-
-  .icon-btn {
-    width: 34px;
-    height: 34px;
-    font-size: 18px;
-    line-height: 1;
-  }
-
-  .today-btn {
-    height: 34px;
-    padding: 0 16px;
-    font-weight: 700;
-  }
-
-  .icon-btn:hover,
-  .today-btn:hover {
-    transform: translateY(-1px);
-    background: #f8fafc;
-    box-shadow: 0 6px 16px rgba(30, 41, 59, 0.08);
-  }
-
-  .workspace {
-    display: grid;
-    grid-template-columns: 296px 1fr;
-    gap: 16px;
-    min-height: calc(100vh - 92px);
-    transition: grid-template-columns 0.22s ease, gap 0.22s ease;
-  }
-
-  .workspace.is-collapsed {
-    grid-template-columns: 0 minmax(0, 1fr);
-    gap: 0;
-  }
-
-  .sidebar {
-    border-radius: 20px;
-    border: 1px solid #dbe3f3;
-    background: linear-gradient(180deg, rgba(255, 255, 255, 0.96), rgba(246, 249, 255, 0.94));
-    padding: 16px;
-    box-shadow: 0 18px 34px rgba(15, 23, 42, 0.08);
-    min-width: 0;
-    transform-origin: left center;
-    transition:
-      width 0.22s ease,
-      padding 0.22s ease,
-      border-width 0.22s ease,
-      opacity 0.22s ease,
-      transform 0.22s ease;
-  }
-
-  .sidebar.is-hidden {
-    width: 0;
-    padding: 0;
-    border-width: 0;
-    opacity: 0;
-    transform: translateX(-10px);
-    overflow: hidden;
-    pointer-events: none;
-  }
-
-  .create-pill {
-    width: 100%;
-    height: 52px;
-    border-radius: 999px;
-    border: 0;
-    display: grid;
-    grid-template-columns: auto 1fr auto;
-    align-items: center;
-    gap: 10px;
-    padding: 0 16px;
-    font-weight: 730;
-    color: #0f172a;
-    background: linear-gradient(145deg, #f8fafc, #e2e8f0);
-    box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.9), 0 8px 18px rgba(148, 163, 184, 0.26);
-    cursor: pointer;
-  }
-
-  .create-plus {
-    color: #3b82f6;
-    font-size: 22px;
-    line-height: 1;
-    font-weight: 900;
-  }
-
-  .create-caret {
-    opacity: 0.7;
-  }
-
-  .create-form {
-    margin-top: 12px;
-    border: 1px solid #dbe3f3;
-    border-radius: 16px;
-    padding: 12px;
-    display: grid;
-    gap: 10px;
-    background: #ffffffd8;
-  }
-
-  .create-form label {
-    display: grid;
-    gap: 5px;
-    font-size: 12px;
-    font-weight: 700;
-    color: #475569;
-  }
-
-  .create-form input {
-    width: 100%;
-    border: 1px solid #d1d9eb;
-    border-radius: 9px;
-    height: 36px;
-    padding: 0 10px;
-    color: #0f172a;
-    background: #fff;
-  }
-
-  .create-form input[type="color"] {
-    padding: 4px;
-    cursor: pointer;
-  }
-
-  .create-form select {
-    width: 100%;
-    border: 1px solid #d1d9eb;
-    border-radius: 9px;
-    height: 36px;
-    padding: 0 10px;
-    color: #0f172a;
-    background: #fff;
-  }
-
-  .save-btn {
-    margin-top: 3px;
-    height: 38px;
-    border: 0;
-    border-radius: 10px;
-    color: #fff;
-    font-weight: 760;
-    cursor: pointer;
-    background: linear-gradient(135deg, #2563eb, #3b82f6);
-    box-shadow: 0 10px 22px rgba(37, 99, 235, 0.25);
-  }
-
-  .save-btn:disabled {
-    opacity: 0.65;
-    cursor: not-allowed;
-  }
-
-  .mini-calendar {
-    margin-top: 14px;
-    padding: 12px 10px;
-    border-radius: 16px;
-    border: 1px solid #dbe3f3;
-    background: #ffffffd8;
-  }
-
-  .mini-header {
-    display: grid;
-    grid-template-columns: 28px 1fr 28px;
-    align-items: center;
-    margin-bottom: 8px;
-    text-align: center;
-    gap: 8px;
-    font-size: 14px;
-    color: #334155;
-  }
-
-  .mini-nav {
-    width: 28px;
-    height: 28px;
-    border: 0;
-    border-radius: 8px;
-    font-size: 17px;
-    cursor: pointer;
-    color: #475569;
-    background: #eef2ff;
-  }
-
-  .mini-grid {
-    display: grid;
-    grid-template-columns: repeat(7, 1fr);
-    gap: 4px;
-  }
-
-  .mini-weekday {
-    text-align: center;
-    font-size: 11px;
-    font-weight: 780;
-    color: #64748b;
-    padding: 4px 0;
-  }
-
-  .mini-day {
-    height: 28px;
-    border: 0;
-    border-radius: 8px;
-    font-size: 12px;
-    cursor: pointer;
-    color: #0f172a;
-    background: transparent;
-  }
-
-  .mini-day.is-outside {
-    opacity: 0.36;
-  }
-
-  .mini-day.is-week {
-    background: #e2e8f0;
-  }
-
-  .mini-day.is-today {
-    color: #fff;
-    background: #2563eb;
-    font-weight: 760;
-  }
-
-  .calendar-panel {
-    position: relative;
-    border-radius: 20px;
-    border: 1px solid #dbe3f3;
-    background: #ffffffea;
-    box-shadow: 0 22px 36px rgba(30, 41, 59, 0.08);
-    overflow: hidden;
-  }
-
-  .calendar-panel.slide-next .calendar-head,
-  .calendar-panel.slide-next .calendar-body {
-    animation: week-slide-next 0.24s ease;
-  }
-
-  .calendar-panel.slide-prev .calendar-head,
-  .calendar-panel.slide-prev .calendar-body {
-    animation: week-slide-prev 0.24s ease;
-  }
-
-  .error-banner {
-    margin: 12px;
-    border-radius: 10px;
-    border: 1px solid #fecaca;
-    color: #b91c1c;
-    background: #fff1f2;
-    padding: 10px 12px;
-    font-size: 13px;
-    font-weight: 650;
-  }
-
-  .edge-switch {
-    position: absolute;
-    top: 0;
-    bottom: 0;
-    width: 40px;
-    z-index: 8;
-    pointer-events: none;
-    opacity: 0;
-    transition: opacity 0.16s ease;
-  }
-
-  .edge-switch.edge-left {
-    left: 0;
-    background: linear-gradient(90deg, rgba(37, 99, 235, 0.28), rgba(37, 99, 235, 0));
-  }
-
-  .edge-switch.edge-right {
-    right: 0;
-    background: linear-gradient(270deg, rgba(37, 99, 235, 0.28), rgba(37, 99, 235, 0));
-  }
-
-  .edge-switch.is-visible {
-    opacity: 1;
-  }
-
-  .calendar-head {
-    display: grid;
-    grid-template-columns: 88px repeat(7, minmax(0, 1fr));
-    border-bottom: 1px solid #dbe3f3;
-    background: linear-gradient(180deg, #ffffff, #f8fbff);
-    min-width: 0;
-  }
-
-  .timezone-head,
-  .day-head {
-    padding: 10px 10px 11px;
-  }
-
-  .timezone-head {
-    font-size: 11px;
-    font-weight: 720;
-    color: #64748b;
-    display: flex;
-    align-items: flex-end;
-    justify-content: flex-end;
-  }
-
-  .day-head {
-    text-align: center;
-    border-left: 1px solid #e4ebf8;
-    color: #334155;
-    display: grid;
-    gap: 3px;
-  }
-
-  .day-head span {
-    font-size: 11px;
-    letter-spacing: 0.5px;
-    font-weight: 780;
-  }
-
-  .day-head strong {
-    font-size: 24px;
-    line-height: 1;
-    font-weight: 770;
-  }
-
-  .day-head.is-today strong {
-    color: #2563eb;
-  }
-
-  .multiday-strip {
-    display: grid;
-    grid-template-columns: 88px minmax(0, 1fr);
-    border-bottom: 1px solid #dbe3f3;
-    background: #f8fbff;
-  }
-
-  .multiday-timepad {
-    border-right: 1px solid #dbe3f3;
-    color: #64748b;
-    font-size: 11px;
-    font-weight: 700;
-    display: flex;
-    align-items: center;
-    justify-content: flex-end;
-    padding: 0 8px 0 0;
-  }
-
-  .multiday-grid {
-    display: grid;
-    grid-template-columns: repeat(7, minmax(0, 1fr));
-    grid-auto-rows: 28px;
-    gap: 2px;
-    padding: 4px 6px 4px 6px;
-  }
-
-  .multiday-card {
-    appearance: none;
-    border: 1px solid rgba(255, 255, 255, 0.92);
-    border-left: 4px solid #3b82f6;
-    border-radius: 10px;
-    padding: 4px 8px;
-    text-align: left;
-    font: inherit;
-    color: #0f172a;
-    cursor: grab;
-    box-shadow: 0 8px 14px rgba(15, 23, 42, 0.12);
-    overflow: hidden;
-  }
-
-  .multiday-title {
-    font-size: 12px;
-    font-weight: 760;
-    line-height: 1.1;
-    white-space: nowrap;
-    overflow: hidden;
-    text-overflow: ellipsis;
-  }
-
-  .multiday-time {
-    margin-top: 2px;
-    font-size: 10px;
-    opacity: 0.76;
-    white-space: nowrap;
-  }
-
-  .multiday-card.is-dragging {
-    opacity: 0.48;
-    transform: scale(0.98);
-  }
-
-  .multiday-card.is-saving {
-    box-shadow: 0 0 0 2px rgba(37, 99, 235, 0.34), 0 8px 14px rgba(15, 23, 42, 0.12);
-  }
-
-  .multiday-card.is-selected {
-    box-shadow: 0 0 0 2px rgba(37, 99, 235, 0.42), 0 10px 18px rgba(15, 23, 42, 0.16);
-  }
-
-  .calendar-body {
-    display: grid;
-    grid-template-columns: 88px minmax(0, 1fr);
-    max-height: calc(100vh - 210px);
-    overflow-y: auto;
-    overflow-x: hidden;
-  }
-
-  .hours-column {
-    display: grid;
-    grid-template-rows: repeat(24, 56px);
-    border-right: 1px solid #dbe3f3;
-    background: #fbfdff;
-  }
-
-  .hour-slot {
-    display: flex;
-    justify-content: flex-end;
-    align-items: flex-start;
-    padding: 2px 8px 0 0;
-    font-size: 11px;
-    color: #64748b;
-    border-top: 1px solid #f1f5f9;
-  }
-
-  .days-scroll {
-    min-width: 0;
-  }
-
-  .days-canvas {
-    position: relative;
-  }
-
-  .hour-lines {
-    position: absolute;
-    inset: 0;
-    background-image: repeating-linear-gradient(
-      to bottom,
-      transparent 0,
-      transparent 55px,
-      #e7edf8 55px,
-      #e7edf8 56px
-    );
-    pointer-events: none;
-  }
-
-  .day-columns {
-    position: absolute;
-    inset: 0;
-    display: grid;
-    grid-template-columns: repeat(7, minmax(0, 1fr));
-  }
-
-  .day-column {
-    position: relative;
-    border-left: 1px solid #edf1f9;
-  }
-
-  .event-card {
-    appearance: none;
-    position: absolute;
-    left: 6px;
-    right: 6px;
-    border-radius: 12px;
-    border: 1px solid rgba(255, 255, 255, 0.92);
-    border-left: 4px solid #3b82f6;
-    padding: 8px 9px;
-    text-align: left;
-    font: inherit;
-    color: #0f172a;
-    cursor: grab;
-    box-shadow: 0 10px 18px rgba(15, 23, 42, 0.14);
-    transition: transform 0.12s ease, box-shadow 0.12s ease, opacity 0.12s ease;
-  }
-
-  .event-card:hover {
-    transform: translateY(-1px);
-    box-shadow: 0 14px 25px rgba(15, 23, 42, 0.18);
-  }
-
-  .event-card.is-dragging {
-    opacity: 0.45;
-    transform: scale(0.98);
-  }
-
-  .event-card.is-saving {
-    box-shadow: 0 0 0 2px rgba(37, 99, 235, 0.38), 0 10px 18px rgba(15, 23, 42, 0.14);
-  }
-
-  .event-card.is-selected {
-    box-shadow: 0 0 0 2px rgba(37, 99, 235, 0.45), 0 14px 26px rgba(15, 23, 42, 0.18);
-  }
-
-  .event-card:focus-visible {
-    outline: none;
-    box-shadow: 0 0 0 2px rgba(37, 99, 235, 0.45), 0 14px 26px rgba(15, 23, 42, 0.18);
-  }
-
-  .event-main {
-    overflow: hidden;
-  }
-
-  .event-title {
-    font-size: 12px;
-    font-weight: 780;
-    line-height: 1.2;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-  }
-
-  .event-time {
-    margin-top: 2px;
-    font-size: 11px;
-    opacity: 0.78;
-    white-space: nowrap;
-  }
-
-  .event-editor {
-    position: absolute;
-    top: 14px;
-    left: 14px;
-    z-index: 20;
-    width: min(430px, calc(100% - 24px));
-    border-radius: 14px;
-    border: 1px solid #dbe3f3;
-    background: #ffffff;
-    box-shadow: 0 20px 34px rgba(15, 23, 42, 0.2);
-    padding: 12px;
-    display: grid;
-    gap: 10px;
-    animation: slide-in 0.18s ease-out;
-  }
-
-  .event-editor-head {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    gap: 10px;
-  }
-
-  .event-editor-head strong {
-    font-size: 14px;
-    color: #0f172a;
-  }
-
-  .editor-close {
-    width: 30px;
-    height: 30px;
-    border: 1px solid #d6deef;
-    border-radius: 9px;
-    background: #fff;
-    color: #334155;
-    cursor: pointer;
-    font-size: 15px;
-    line-height: 1;
-  }
-
-  .editor-error {
-    border-radius: 8px;
-    border: 1px solid #fecaca;
-    color: #b91c1c;
-    background: #fff1f2;
-    padding: 8px 10px;
-    font-size: 12px;
-    font-weight: 650;
-  }
-
-  .event-editor label {
-    display: grid;
-    gap: 5px;
-    font-size: 12px;
-    font-weight: 700;
-    color: #475569;
-  }
-
-  .event-editor input[type="text"],
-  .event-editor input[type="datetime-local"] {
-    width: 100%;
-    border: 1px solid #d1d9eb;
-    border-radius: 9px;
-    height: 36px;
-    padding: 0 10px;
-    color: #0f172a;
-    background: #fff;
-  }
-
-  .event-editor select {
-    width: 100%;
-    border: 1px solid #d1d9eb;
-    border-radius: 9px;
-    height: 36px;
-    padding: 0 10px;
-    color: #0f172a;
-    background: #fff;
-  }
-
-  .event-editor-row {
-    display: grid;
-    grid-template-columns: repeat(2, minmax(0, 1fr));
-    gap: 8px;
-  }
-
-  .event-editor-actions {
-    display: flex;
-    align-items: flex-end;
-    justify-content: flex-end;
-    gap: 8px;
-    flex-wrap: wrap;
-  }
-
-  .event-editor-color {
-    margin-right: auto;
-  }
-
-  .event-color-input {
-    width: 46px;
-    height: 34px;
-    border: 1px solid rgba(15, 23, 42, 0.18);
-    border-radius: 8px;
-    padding: 2px;
-    background: #fff;
-    cursor: pointer;
-  }
-
-  .editor-delete-btn {
-    height: 34px;
-    border: 0;
-    border-radius: 8px;
-    color: #fff;
-    background: rgba(190, 24, 93, 0.9);
-    cursor: pointer;
-    font-size: 12px;
-    font-weight: 700;
-    padding: 0 12px;
-  }
-
-  .editor-save-btn {
-    height: 34px;
-    border: 0;
-    border-radius: 8px;
-    color: #fff;
-    background: linear-gradient(135deg, #2563eb, #3b82f6);
-    cursor: pointer;
-    font-size: 12px;
-    font-weight: 700;
-    padding: 0 14px;
-  }
-
-  .editor-delete-btn:disabled,
-  .editor-save-btn:disabled,
-  .event-color-input:disabled {
-    opacity: 0.48;
-    cursor: not-allowed;
-  }
-
-  .delete-modal-backdrop {
-    position: absolute;
-    inset: 0;
-    z-index: 24;
-    display: grid;
-    place-items: center;
-    background: rgba(15, 23, 42, 0.25);
-  }
-
-  .delete-modal {
-    width: min(360px, calc(100% - 20px));
-    border-radius: 14px;
-    border: 1px solid #dbe3f3;
-    background: #fff;
-    box-shadow: 0 20px 34px rgba(15, 23, 42, 0.22);
-    padding: 14px;
-    display: grid;
-    gap: 10px;
-  }
-
-  .delete-modal h3 {
-    margin: 0;
-    font-size: 16px;
-    color: #0f172a;
-  }
-
-  .delete-modal p {
-    margin: 0;
-    font-size: 13px;
-    color: #475569;
-  }
-
-  .delete-scope-option {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    font-size: 13px;
-    color: #334155;
-  }
-
-  .delete-modal-actions {
-    margin-top: 2px;
-    display: flex;
-    justify-content: flex-end;
-    gap: 8px;
-  }
-
-  .delete-cancel-btn,
-  .delete-confirm-btn {
-    height: 34px;
-    border: 0;
-    border-radius: 8px;
-    padding: 0 12px;
-    font-size: 12px;
-    font-weight: 700;
-    cursor: pointer;
-  }
-
-  .delete-cancel-btn {
-    color: #334155;
-    background: #e2e8f0;
-  }
-
-  .delete-confirm-btn {
-    color: #fff;
-    background: rgba(190, 24, 93, 0.9);
-  }
-
-  .delete-confirm-btn:disabled {
-    opacity: 0.5;
-    cursor: not-allowed;
-  }
-
-  .drop-preview {
-    position: absolute;
-    left: 6px;
-    right: 6px;
-    border-radius: 12px;
-    border: 2px dashed #3b82f6;
-    pointer-events: none;
-  }
-
-  .empty-state {
-    position: absolute;
-    top: 68px;
-    left: 50%;
-    transform: translateX(-50%);
-    border: 1px solid #dbe3f3;
-    background: #f8fafc;
-    border-radius: 999px;
-    padding: 8px 14px;
-    font-size: 12px;
-    color: #64748b;
-    font-weight: 680;
-  }
-
-  .helper-text {
-    margin: 10px 14px 12px;
-    font-size: 12px;
-    color: #64748b;
-  }
-
-  @media (max-width: 1180px) {
-    .workspace {
-      grid-template-columns: 1fr;
-    }
-
-    .workspace.is-collapsed {
-      grid-template-columns: 1fr;
-    }
-
-    .sidebar {
-      order: 2;
-    }
-
-    .sidebar.is-hidden {
-      display: none;
-    }
-
-    .calendar-panel {
-      order: 1;
-      min-height: 560px;
-    }
-  }
-
-  @media (max-width: 820px) {
-    .app-shell {
-      padding: 8px;
-    }
-
-    .topbar {
-      flex-direction: column;
-      align-items: flex-start;
-    }
-
-    .topbar-center {
-      flex-wrap: wrap;
-    }
-
-    .month-title {
-      margin-left: 0;
-      width: 100%;
-      font-size: 20px;
-    }
-
-    .calendar-body {
-      max-height: 62vh;
-    }
-
-    .event-editor {
-      top: auto;
-      left: 8px;
-      width: auto;
-      bottom: 8px;
-    }
-
-    .event-editor-row {
-      grid-template-columns: 1fr;
-    }
-  }
-
-  @keyframes week-slide-next {
-    from {
-      transform: translateX(18px);
-      opacity: 0.86;
-    }
-
-    to {
-      transform: translateX(0);
-      opacity: 1;
-    }
-  }
-
-  @keyframes week-slide-prev {
-    from {
-      transform: translateX(-18px);
-      opacity: 0.86;
-    }
-
-    to {
-      transform: translateX(0);
-      opacity: 1;
-    }
-  }
-
-  @keyframes slide-in {
-    from {
-      opacity: 0;
-      transform: translateY(-8px);
-    }
-
-    to {
-      opacity: 1;
-      transform: translateY(0);
-    }
-  }
-</style>
+</div>
